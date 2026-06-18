@@ -1,0 +1,15 @@
+# Core
+pandas
+python-dotenv
+
+# Tool-arg validation (used from Phase 1)
+pydantic
+
+# LLM client (used from Phase 0.5)
+openai
+
+# Token estimation (optional; we fall back to char heuristic if absent)
+tiktoken
+
+# Dev / tests
+pytest

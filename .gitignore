@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.DS_Store
+
+# Run artifacts
+results/
+*.log
+
+# Dataset is large; keep it out of git (clone separately)
+WikiTableQuestions/
+
+# Reference code copied for study only
+openclaw-agent-study/
