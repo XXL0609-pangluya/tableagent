@@ -1,6 +1,7 @@
-"""Run the Phase-1 function-calling agent on a quick-set sample and report accuracy.
+"""Run the Phase-1 function-calling agent on an eval subset and report accuracy.
 
-Run:  python -m scripts.run_agent [n] [model]
+Run:  python -m scripts.run_agent [n] [which] [model]
+  which in {quick, fresh}  (default quick; 'fresh' = disjoint held-out 200)
 Defaults to n=20 to keep cost low. Writes predictions + per-example traces to results/.
 """
 from __future__ import annotations
@@ -27,21 +28,22 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 def main() -> int:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 20
-    model = sys.argv[2] if len(sys.argv) > 2 else None
+    which = sys.argv[2] if len(sys.argv) > 2 else "quick"
+    model = sys.argv[3] if len(sys.argv) > 3 else None
 
     cfg = load_llm_config(model=model)
     client = LLMClient(cfg)
     prompts = load_prompts()
     registry = build_registry()
-    budget = Budget(max_steps=6)
-    print(f"model={cfg.model}  n={n}  split={SPLIT}  max_steps={budget.max_steps}")
+    budget = Budget(max_steps=8)
+    print(f"model={cfg.model}  n={n}  set={which}  split={SPLIT}  max_steps={budget.max_steps}")
 
-    examples = data.sample_examples(data.load_examples(SPLIT), QUICK_N)[:n]
+    examples = data.eval_subset(data.load_examples(SPLIT), n, which)
     tagged = evaluator.find_tagged_path(data.DEFAULT_DATASET_ROOT, SPLIT)
     targets_all = evaluator.load_targets_from_tagged(tagged)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    trace_path = os.path.join(RESULTS_DIR, f"trace_agent_{cfg.model}_{n}.jsonl")
+    trace_path = os.path.join(RESULTS_DIR, f"trace_agent_{cfg.model}_{which}_{n}.jsonl")
     if os.path.exists(trace_path):
         os.remove(trace_path)
 
@@ -67,9 +69,9 @@ def main() -> int:
     targets = {ex.id: targets_all[ex.id] for ex in examples if ex.id in targets_all}
     result = evaluator.evaluate(predictions, targets)
 
-    out = os.path.join(RESULTS_DIR, f"agent_{cfg.model}_{n}.json")
+    out = os.path.join(RESULTS_DIR, f"agent_{cfg.model}_{which}_{n}.json")
     with open(out, "w", encoding="utf8") as f:
-        json.dump({"config": {"model": cfg.model, "n": n, "split": SPLIT, "max_steps": budget.max_steps},
+        json.dump({"config": {"model": cfg.model, "n": n, "set": which, "split": SPLIT, "max_steps": budget.max_steps},
                    "metrics": {k: v for k, v in result.items() if k != "per_example"},
                    "elapsed_s": round(time.time() - t0, 1),
                    "rows": rows}, f, ensure_ascii=False, indent=2)

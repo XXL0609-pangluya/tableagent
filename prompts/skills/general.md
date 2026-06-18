@@ -14,10 +14,16 @@ Applies to any question when no more specific skill is selected.
    - difference:  cast two numbers, subtract, `answer = abs(a - b)`
    - previous/next: sort or use position relative to the matched row.
 4. Check the result is non-empty and sensible; if not, adjust and retry.
-5. `submit_answer` with the final items.
+5. `submit_answer` with the final items — as soon as a run_python result answers
+   the question. Don't spend extra steps re-verifying an answer you already have.
 
 ## Common mistakes to avoid
+- Printing the answer with `print()` but forgetting to assign it to `answer`,
+  then running out of steps. Always set `answer = ...`.
+- Exploring too long. Once you have the value, submit it immediately.
 - Forgetting to strip thousands separators / units before casting to number.
 - Returning the whole row instead of the asked-for column.
 - Returning multiple items when one is expected (or vice versa).
+- Answering "True"/"False" for a yes/no question (use "yes"/"no"), or returning a
+  code like "ITA" when the cell reads "Italy".
 - Answering from the schema/sample without checking the actual rows.

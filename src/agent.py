@@ -17,7 +17,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from .formatter import parse_answer_text
+from .formatter import normalize_items, parse_answer_text
 from .harness import execute_tool
 from .llm import LLMClient
 from .schemas import (
@@ -71,6 +71,29 @@ def _build_user(example: Example, tc: TableContext) -> str:
     )
 
 
+_FINAL_INSTRUCTION = (
+    "You did not submit an answer and have no steps left. Based ONLY on the tool "
+    "outputs above, output the FINAL answer now and nothing else — no explanation, "
+    "no code. Rules: copy the value exactly as it appears in the table (full name, "
+    "not a code/abbreviation; drop any leading '#'); for a yes/no question answer "
+    "'yes' or 'no'; for several values separate them with ' | '."
+)
+
+
+def _force_final_answer(client: LLMClient, messages: list[dict], example: Example) -> list[str]:
+    """Last-resort recovery: the answer is often already in the transcript (e.g.
+    printed by run_python) but was never submitted. Make one tool-free call to
+    extract it instead of returning an empty prediction."""
+    try:
+        resp = client.chat(
+            messages + [{"role": "user", "content": _FINAL_INSTRUCTION}],
+            max_tokens=120,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    return parse_answer_text(resp.text or "")
+
+
 def run_example(
     example: Example,
     table_context: TableContext,
@@ -95,6 +118,13 @@ def run_example(
 
     for step in range(budget.max_steps):
         state.steps_used = step + 1
+        # On the final allowed step, stop exploring and force a commitment.
+        if step == budget.max_steps - 1:
+            messages.append({
+                "role": "user",
+                "content": "This is your final step. Call submit_answer now with your best "
+                           "answer based on the evidence you already have. Do not call any other tool.",
+            })
         try:
             resp = client.chat(messages, tools=tools, tool_choice="auto", max_tokens=900)
         except Exception as exc:  # noqa: BLE001
@@ -157,10 +187,16 @@ def run_example(
     if items is None:
         if last_run_items:
             items, source = last_run_items, "last_run_python"
-        elif last_text:
-            items, source = parse_answer_text(last_text), "last_text"
         else:
-            items, source = [], "empty_fallback"
+            forced = _force_final_answer(client, messages, example)
+            if forced:
+                items, source = forced, "forced_final"
+            elif last_text:
+                items, source = parse_answer_text(last_text), "last_text"
+            else:
+                items, source = [], "empty_fallback"
+
+    items = normalize_items(items or [], example.utterance)
 
     evidence = dict(state.evidence)
     evidence.update({"answer_source": source, "steps_used": state.steps_used, "terminated": terminated})

@@ -50,6 +50,53 @@ def parse_answer_text(text: str) -> list[str]:
     return parts if parts else [_strip_item(text)]
 
 
+_YESNO_STARTS = (
+    "is ", "are ", "was ", "were ", "does ", "do ", "did ", "has ", "have ",
+    "had ", "can ", "could ", "will ", "would ", "should ",
+)
+
+
+def _looks_yesno(question: str) -> bool:
+    q = (question or "").strip().lower()
+    return q.startswith(_YESNO_STARTS)
+
+
+def normalize_items(items: list[str], question: str = "") -> list[str]:
+    """Light, lossless-ish answer cleanup before grading.
+
+    The evaluator already handles case/commas/parentheses, so we only fix surface
+    issues the model commonly emits that the evaluator does NOT forgive:
+      - python/yes-no boolean phrasing matched to what the question expects:
+          * "true or false?" questions  -> true/false
+          * plain yes/no questions       -> yes/no
+      - a leading row-number marker like '#163' -> '163'
+      - collapse an accidental multi-line cell to its first line
+    """
+    out: list[str] = []
+    ql = (question or "").lower()
+    wants_truefalse = "true or false" in ql or "true/false" in ql
+    yesno = _looks_yesno(question)
+    bool_map = {True: "true", False: "false"} if wants_truefalse else {True: "yes", False: "no"}
+    for raw in items:
+        s = str(raw).strip()
+        if not s:
+            continue
+        low = s.lower()
+        if low in ("true", "yes"):
+            s = bool_map[True]
+        elif low in ("false", "no"):
+            s = bool_map[False]
+        elif yesno and low in ("yes.", "no."):
+            s = low[:-1]
+        if "\n" in s:
+            s = s.split("\n", 1)[0].strip()
+        if len(s) > 1 and s[0] == "#" and s[1:].lstrip().isdigit():
+            s = s[1:].strip()
+        if s:
+            out.append(s)
+    return out
+
+
 def items_from_structured(structured: dict[str, Any]) -> list[str]:
     """Coerce run_python's `answer_items` into a clean list[str]."""
     items = structured.get("answer_items")

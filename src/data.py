@@ -126,3 +126,27 @@ def sample_examples(
         return list(examples)
     rng = random.Random(seed)
     return rng.sample(examples, n)
+
+
+# The original quick set (used for the first 200-example measurement).
+QUICK_SEED = 13
+QUICK_SET_SIZE = 200
+FRESH_SEED = 29
+
+
+def eval_subset(
+    examples: list[Example], n: int, which: str = "quick"
+) -> list[Example]:
+    """Return an evaluation subset.
+
+    which="quick": the original quick set (sample with QUICK_SEED), first n.
+    which="fresh": a disjoint held-out subset (excludes the quick-200 ids) so we
+                   can re-measure on data the agent was not tuned against.
+    """
+    if which == "quick":
+        return sample_examples(examples, QUICK_SET_SIZE, QUICK_SEED)[:n]
+    if which == "fresh":
+        quick_ids = {e.id for e in sample_examples(examples, QUICK_SET_SIZE, QUICK_SEED)}
+        pool = [e for e in examples if e.id not in quick_ids]
+        return sample_examples(pool, n, FRESH_SEED)
+    raise ValueError(f"unknown eval subset: {which!r} (use 'quick' or 'fresh')")

@@ -7,6 +7,7 @@ Phase 1; this module deliberately stays provider-agnostic and dependency-light.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -54,7 +55,7 @@ class LLMClient:
             if tool_choice:
                 kwargs["tool_choice"] = tool_choice
 
-        resp = self._client.chat.completions.create(**kwargs)
+        resp = self._create_with_retry(kwargs)
         choice = resp.choices[0]
         msg = choice.message
 
@@ -81,6 +82,22 @@ class LLMClient:
             usage=usage,
             raw=resp,
         )
+
+    def _create_with_retry(self, kwargs: dict[str, Any], attempts: int = 3, backoff_s: float = 1.5):
+        """Call the endpoint with retries on transient errors (timeouts / 5xx / rate limits).
+
+        A single dropped request used to surface as an empty prediction in a long
+        batch run, so we retry a few times before giving up.
+        """
+        last_exc: Optional[Exception] = None
+        for i in range(attempts):
+            try:
+                return self._client.chat.completions.create(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if i < attempts - 1:
+                    time.sleep(backoff_s * (i + 1))
+        raise last_exc  # type: ignore[misc]
 
     def probe_native_tools(self) -> tuple[bool, str]:
         """Check whether the model supports native function calling.

@@ -1,6 +1,7 @@
-"""Run the direct-answer baseline on a small quick-set sample and report accuracy.
+"""Run the direct-answer baseline on an eval subset and report accuracy.
 
-Run:  python -m scripts.run_baseline [n] [model]
+Run:  python -m scripts.run_baseline [n] [which] [model]
+  which in {quick, fresh}  (default quick; 'fresh' = disjoint held-out 200)
 Defaults to n=30 to keep cost low.
 """
 from __future__ import annotations
@@ -24,13 +25,14 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 def main() -> int:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 30
-    model = sys.argv[2] if len(sys.argv) > 2 else None
+    which = sys.argv[2] if len(sys.argv) > 2 else "quick"
+    model = sys.argv[3] if len(sys.argv) > 3 else None
 
     cfg = load_llm_config(model=model)
     client = LLMClient(cfg)
-    print(f"model={cfg.model}  n={n}  split={SPLIT}")
+    print(f"model={cfg.model}  n={n}  set={which}  split={SPLIT}")
 
-    examples = data.sample_examples(data.load_examples(SPLIT), QUICK_N)[:n]
+    examples = data.eval_subset(data.load_examples(SPLIT), n, which)
     tagged = evaluator.find_tagged_path(data.DEFAULT_DATASET_ROOT, SPLIT)
     targets_all = evaluator.load_targets_from_tagged(tagged)
 
@@ -57,9 +59,9 @@ def main() -> int:
     result = evaluator.evaluate(predictions, targets)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    out = os.path.join(RESULTS_DIR, f"baseline_direct_{cfg.model}_{n}.json")
+    out = os.path.join(RESULTS_DIR, f"baseline_direct_{cfg.model}_{which}_{n}.json")
     with open(out, "w", encoding="utf8") as f:
-        json.dump({"config": {"model": cfg.model, "n": n, "split": SPLIT},
+        json.dump({"config": {"model": cfg.model, "n": n, "set": which, "split": SPLIT},
                    "metrics": {k: v for k, v in result.items() if k != "per_example"},
                    "total_tokens": total_tokens,
                    "elapsed_s": round(time.time() - t0, 1),
