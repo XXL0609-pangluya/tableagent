@@ -39,15 +39,19 @@ def main() -> int:
     rows = []
     t0 = time.time()
     for i, ex in enumerate(examples, 1):
-        tc = data.load_table(ex.table_path)
-        pred, usage = run_direct_answer(ex, tc, client)
+        try:
+            tc = data.load_table(ex.table_path)
+            pred, usage = run_direct_answer(ex, tc, client)
+        except Exception as exc:
+            from src.schemas import Prediction
+            pred, usage = Prediction(id=ex.id, items=[], evidence={"error": str(exc)}), {}
         predictions[ex.id] = pred.items
         total_tokens += usage.get("total_tokens", 0)
         rows.append({
             "id": ex.id, "q": ex.utterance,
             "pred": pred.items, "gold": ex.target_value,
         })
-        print(f"  [{i}/{n}] {ex.id}: pred={pred.items} gold={ex.target_value}")
+        print(f"  [{i}/{n}] {ex.id}: pred={pred.items} gold={ex.target_value}", flush=True)
 
     targets = {ex.id: targets_all[ex.id] for ex in examples if ex.id in targets_all}
     result = evaluator.evaluate(predictions, targets)

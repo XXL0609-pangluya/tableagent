@@ -1,0 +1,86 @@
+"""Run the Phase-1 function-calling agent on a quick-set sample and report accuracy.
+
+Run:  python -m scripts.run_agent [n] [model]
+Defaults to n=20 to keep cost low. Writes predictions + per-example traces to results/.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src import data, evaluator
+from src.agent import load_prompts, run_example
+from src.config import load_llm_config
+from src.llm import LLMClient
+from src.schemas import Budget
+from src.tools.wtq_tools import build_registry
+from src.trace import Tracer
+
+SPLIT = "random-split-1-dev"
+QUICK_N = 200
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "results")
+
+
+def main() -> int:
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 20
+    model = sys.argv[2] if len(sys.argv) > 2 else None
+
+    cfg = load_llm_config(model=model)
+    client = LLMClient(cfg)
+    prompts = load_prompts()
+    registry = build_registry()
+    budget = Budget(max_steps=6)
+    print(f"model={cfg.model}  n={n}  split={SPLIT}  max_steps={budget.max_steps}")
+
+    examples = data.sample_examples(data.load_examples(SPLIT), QUICK_N)[:n]
+    tagged = evaluator.find_tagged_path(data.DEFAULT_DATASET_ROOT, SPLIT)
+    targets_all = evaluator.load_targets_from_tagged(tagged)
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    trace_path = os.path.join(RESULTS_DIR, f"trace_agent_{cfg.model}_{n}.jsonl")
+    if os.path.exists(trace_path):
+        os.remove(trace_path)
+
+    predictions: dict[str, list[str]] = {}
+    rows = []
+    t0 = time.time()
+    for i, ex in enumerate(examples, 1):
+        try:
+            tc = data.load_table(ex.table_path)
+            tracer = Tracer(trace_path, ex.id)
+            pred = run_example(ex, tc, registry, client, prompts, budget=budget, tracer=tracer)
+            tracer.flush(extra={"question": ex.utterance, "gold": ex.target_value, "pred": pred.items})
+        except Exception as exc:  # keep a long run alive on a single bad example
+            from src.schemas import Prediction
+            pred = Prediction(id=ex.id, items=[], evidence={"error": f"{type(exc).__name__}: {exc}"})
+        predictions[ex.id] = pred.items
+        rows.append({"id": ex.id, "q": ex.utterance, "pred": pred.items,
+                     "gold": ex.target_value, "src": pred.evidence.get("answer_source"),
+                     "steps": pred.evidence.get("steps_used")})
+        print(f"  [{i}/{n}] {ex.id}: pred={pred.items} gold={ex.target_value} "
+              f"(src={pred.evidence.get('answer_source')}, steps={pred.evidence.get('steps_used')})", flush=True)
+
+    targets = {ex.id: targets_all[ex.id] for ex in examples if ex.id in targets_all}
+    result = evaluator.evaluate(predictions, targets)
+
+    out = os.path.join(RESULTS_DIR, f"agent_{cfg.model}_{n}.json")
+    with open(out, "w", encoding="utf8") as f:
+        json.dump({"config": {"model": cfg.model, "n": n, "split": SPLIT, "max_steps": budget.max_steps},
+                   "metrics": {k: v for k, v in result.items() if k != "per_example"},
+                   "elapsed_s": round(time.time() - t0, 1),
+                   "rows": rows}, f, ensure_ascii=False, indent=2)
+
+    print("\n==== RESULT ====")
+    print(f"accuracy = {result['accuracy']}  ({result['num_correct']}/{result['num_examples']})")
+    print(f"elapsed  = {round(time.time() - t0, 1)}s")
+    print(f"saved    = {out}")
+    print(f"traces   = {trace_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

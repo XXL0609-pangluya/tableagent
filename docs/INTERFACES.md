@@ -12,7 +12,7 @@
 |---|---|---|
 | 0 | 无模型地基（schemas/data/evaluator/trace/sandbox/tools.base/context_budget + smoke） | ✅ smoke PASS（评测器对齐=1.0，200/200 表加载） |
 | 0.5 | config + llm.py(原生 FC 可用) + direct-answer baseline | ✅ baseline 0.70(14/20) on quick-set 抽样 |
-| 1 | 单轨 function-calling agent（4~5 工具 + 循环 + 宽松 verifier + trace） | ⬜ |
+| 1 | 单轨 function-calling agent（5 工具 + 循环 + pipeline + trace） | ✅ agent 0.75 vs baseline 0.70 (15 vs 14 / 20) |
 | 2 | grounding / 严格 verify / 自一致性 / router + skill 库 | ⬜ |
 | 3 | 错误归因驱动迭代（skill 从错误里长出来） | ⬜ |
 | 4 | 对比实验 + 测试集最终分数 + 报告 | ⬜ |
@@ -85,10 +85,22 @@
 ## `src/baselines.py` — 对照基线
 - `run_direct_answer(example, table_context, client) -> (Prediction, usage)`（整表直答，不抛异常）
 
+## `src/tools/wtq_tools.py` — 5 个 WTQ 工具 [1]
+- `InspectTableTool / SearchColumnsTool / SearchCellsTool / RunPythonTool / SubmitAnswerTool`
+- `build_registry(run_python_timeout_s=10.0) -> ToolRegistry`
+- `coerce_items(value) -> list[str]`（pandas/标量 → 答案项）
+- 约定：`run_python` 代码须设 `answer`；`submit_answer` 置 `terminate=True`。
+
+## `src/harness.py` — 工具调用流水线 [1]
+- `execute_tool(registry, name, args, state) -> ToolResult`（未知/不可用/缺参/崩溃都转 ToolResult，永不抛）
+
+## `src/agent.py` — 单轨 agent 循环 [1]
+- `Prompts{charter, general_skill}.system`；`load_prompts(dir) -> Prompts`
+- `to_openai_tools(specs) -> list[dict]`
+- `run_example(example, table_context, registry, client, prompts, budget=None, tracer=None) -> Prediction`
+- 兜底顺序：submit_answer → 最后一次 run_python 的 answer_items → 最后文本 → 空。
+
 ## 待建模块（接口先占位，Phase 推进时填实现）
-- `src/agent.py` [1]：`run_example(example, registry, llm, budget, tracer) -> Prediction`；每步 `transformContext` 装配上下文。
-- `src/harness.py` [1]：step budget / 超时 / 兜底 / 重试分类 / 工具调用流水线(校验→before→exec→after)。
-- `src/formatter.py` [1]：`to_answer_items(structured|raw) -> list[str]`（复用 evaluator 归一化）。
 - `src/verifier.py` [1 宽松→2 严格]：`verify(state, answer) -> VerifyResult{ok, qtype, diagnostics}`（分类型）。
 - `src/router.py` [2]：`route(utterance) -> list[skill_name]`。
 - `src/consistency.py` [2]：`vote(trajectory_answers) -> (items, confidence)`（按 evaluator 归一化投票）。
