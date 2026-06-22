@@ -278,17 +278,24 @@ def load_targets_from_tsv(tsv_path: str) -> dict[str, list[Value]]:
 def evaluate(
     predictions: dict[str, list[str]],
     targets: dict[str, list[Value]],
+    exclude_ids: Optional[set] = None,
 ) -> dict:
     """Score predictions against targets.
 
     Args:
         predictions: ex_id -> list of predicted item strings (empty list = no prediction)
         targets: ex_id -> list[Value] (from load_targets_*)
+        exclude_ids: ids of disputed examples to also report an 'adjusted' score for.
     Returns:
-        dict with accuracy, num_examples, num_correct, and per-example correctness.
+        dict with raw accuracy + (if exclude_ids) adjusted accuracy (disputed removed),
+        plus per-example correctness.
     """
+    exclude_ids = exclude_ids or set()
     num_examples = 0
     num_correct = 0
+    num_correct_adj = 0
+    num_examples_adj = 0
+    num_excluded = 0
     per_example: dict[str, bool] = {}
     missing: list[str] = []
 
@@ -298,19 +305,31 @@ def evaluate(
         if pred_items is None:
             missing.append(ex_id)
             per_example[ex_id] = False
-            continue
-        predicted_values = to_value_list(pred_items) if pred_items else []
-        correct = check_denotation(target_values, predicted_values)
-        per_example[ex_id] = correct
+            correct = False
+        else:
+            predicted_values = to_value_list(pred_items) if pred_items else []
+            correct = check_denotation(target_values, predicted_values)
+            per_example[ex_id] = correct
         if correct:
             num_correct += 1
+        if ex_id in exclude_ids:
+            num_excluded += 1
+        else:
+            num_examples_adj += 1
+            if correct:
+                num_correct_adj += 1
 
     accuracy = (num_correct + 1e-9) / (num_examples + 1e-9) if num_examples else 0.0
+    accuracy_adj = (num_correct_adj + 1e-9) / (num_examples_adj + 1e-9) if num_examples_adj else 0.0
     return {
         "accuracy": round(accuracy, 4),
         "num_examples": num_examples,
         "num_correct": num_correct,
         "num_missing_predictions": len(missing),
+        "accuracy_adjusted": round(accuracy_adj, 4),
+        "num_examples_adjusted": num_examples_adj,
+        "num_correct_adjusted": num_correct_adj,
+        "num_excluded_disputed": num_excluded,
         "per_example": per_example,
     }
 

@@ -1,8 +1,7 @@
 """Run the direct-answer baseline on an eval subset and report accuracy.
 
 Run:  python -m scripts.run_baseline [n] [which] [model]
-  which in {quick, fresh}  (default quick; 'fresh' = disjoint held-out 200)
-Defaults to n=30 to keep cost low.
+  which in {quick, fresh, holdout}
 """
 from __future__ import annotations
 
@@ -56,7 +55,8 @@ def main() -> int:
         print(f"  [{i}/{n}] {ex.id}: pred={pred.items} gold={ex.target_value}", flush=True)
 
     targets = {ex.id: targets_all[ex.id] for ex in examples if ex.id in targets_all}
-    result = evaluator.evaluate(predictions, targets)
+    disputed = data.load_disputed()
+    result = evaluator.evaluate(predictions, targets, exclude_ids=set(disputed))
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out = os.path.join(RESULTS_DIR, f"baseline_direct_{cfg.model}_{which}_{n}.json")
@@ -68,7 +68,10 @@ def main() -> int:
                    "rows": rows}, f, ensure_ascii=False, indent=2)
 
     print("\n==== RESULT ====")
-    print(f"accuracy     = {result['accuracy']}  ({result['num_correct']}/{result['num_examples']})")
+    print(f"accuracy (raw)      = {result['accuracy']}  ({result['num_correct']}/{result['num_examples']})")
+    print(f"accuracy (adjusted) = {result['accuracy_adjusted']}  "
+          f"({result['num_correct_adjusted']}/{result['num_examples_adjusted']}, "
+          f"excluded {result['num_excluded_disputed']} disputed)")
     print(f"total_tokens = {total_tokens}")
     print(f"elapsed      = {round(time.time() - t0, 1)}s")
     print(f"saved        = {out}")

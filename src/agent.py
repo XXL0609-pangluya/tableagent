@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .formatter import normalize_items, parse_answer_text
@@ -30,27 +31,62 @@ from .schemas import (
     ToolCall,
     TraceEvent,
 )
+from .verifier import build_verify_feedback, verify
 from .tools.base import ToolRegistry, ToolSpec
 
 _PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prompts")
 
 
+# Deterministic skill router: question keyword -> extra skill files to inject on
+# top of the always-on `general` skill. Kept simple/auditable (PLAN.md §2.2).
+_SKILL_TRIGGERS: dict[str, tuple[str, ...]] = {
+    "aggregation": (
+        r"\bhow many\b", r"\bnumber of\b", r"\btotal\b", r"\bsum\b", r"\bcombined\b",
+        r"\bdifference\b", r"\baverage\b", r"\bmean\b", r"\bcount\b",
+        r"\bmost\b", r"\bleast\b", r"\bhighest\b", r"\blowest\b", r"\bfewest\b",
+        r"\bgreatest\b", r"\bmaximum\b", r"\bminimum\b", r"\bmore\b", r"\bfewer\b",
+    ),
+    "positional": (
+        r"\bnext\b", r"\bprevious\b", r"\bbefore\b", r"\bafter\b", r"\bpreceding\b",
+        r"\bfollowing\b", r"\babove\b", r"\bbelow\b", r"\blast\b", r"\bfirst\b",
+        r"\bmiddle\b", r"\bconsecutive\b", r"\bprior\b",
+    ),
+}
+
+
+def select_skills(question: str) -> list[str]:
+    """Pick extra skills for a question (besides the always-on 'general')."""
+    q = (question or "").lower()
+    chosen: list[str] = []
+    for skill, patterns in _SKILL_TRIGGERS.items():
+        if any(re.search(p, q) for p in patterns):
+            chosen.append(skill)
+    return chosen
+
+
 @dataclass
 class Prompts:
     charter: str
-    general_skill: str
+    skills: dict[str, str] = field(default_factory=dict)
 
-    @property
-    def system(self) -> str:
-        return self.charter + "\n\n" + self.general_skill
+    def system_for(self, question: str) -> tuple[str, list[str]]:
+        """Assemble the system prompt for a question and report skills used."""
+        used = ["general"] + [s for s in select_skills(question) if s in self.skills]
+        body = [self.charter] + [self.skills[name] for name in used if name in self.skills]
+        return "\n\n".join(body), used
 
 
 def load_prompts(prompts_dir: str = _PROMPTS_DIR) -> Prompts:
     with open(os.path.join(prompts_dir, "AGENT.md"), encoding="utf8") as f:
         charter = f.read()
-    with open(os.path.join(prompts_dir, "skills", "general.md"), encoding="utf8") as f:
-        general = f.read()
-    return Prompts(charter=charter, general_skill=general)
+    skills: dict[str, str] = {}
+    skills_dir = os.path.join(prompts_dir, "skills")
+    for name in ("general", "aggregation", "positional"):
+        path = os.path.join(skills_dir, f"{name}.md")
+        if os.path.exists(path):
+            with open(path, encoding="utf8") as f:
+                skills[name] = f.read()
+    return Prompts(charter=charter, skills=skills)
 
 
 def to_openai_tools(specs: list[ToolSpec]) -> list[dict]:
@@ -94,6 +130,27 @@ def _force_final_answer(client: LLMClient, messages: list[dict], example: Exampl
     return parse_answer_text(resp.text or "")
 
 
+def _evidence_summary(state: AgentState) -> str:
+    parts = []
+    submitted = state.evidence.get("submitted")
+    if submitted:
+        parts.append(f"submitted_evidence: {submitted}")
+    return " | ".join(parts)[:600] if parts else "(none)"
+
+
+def _table_view(tc: TableContext, max_rows: int = 30, max_chars: int = 2500) -> str:
+    """Compact table rendering for the verifier to inspect (schema + rows)."""
+    lines = [tc.schema_text, "", "Rows:"]
+    df = tc.df
+    for i in range(min(max_rows, len(df))):
+        cells = " | ".join(f"{c}={str(df.iloc[i][c])}" for c in df.columns)
+        lines.append(f"  [{i}] {cells}")
+    if len(df) > max_rows:
+        lines.append(f"  ... ({len(df) - max_rows} more rows)")
+    text = "\n".join(lines)
+    return text if len(text) <= max_chars else text[:max_chars] + "\n…(truncated)"
+
+
 def run_example(
     example: Example,
     table_context: TableContext,
@@ -102,12 +159,16 @@ def run_example(
     prompts: Prompts,
     budget: Optional[Budget] = None,
     tracer=None,
+    verifier_client: Optional[LLMClient] = None,
 ) -> Prediction:
     budget = budget or Budget()
     state = AgentState(example=example, table_context=table_context, budget=budget)
 
+    system_prompt, skills_used = prompts.system_for(example.utterance)
+    if tracer:
+        tracer.add(TraceEvent(step=0, kind="skills", note=",".join(skills_used)))
     messages: list[dict] = [
-        {"role": "system", "content": prompts.system},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": _build_user(example, table_context)},
     ]
     tools = to_openai_tools(registry.specs(state))
@@ -115,6 +176,12 @@ def run_example(
     last_run_items: Optional[list[str]] = None
     last_text: str = ""
     terminated = False
+    verify_retries = 0
+    last_verify: Optional[dict] = None
+    # Candidate pool: every submitted answer with whether it passed verification.
+    # Lets us fall back to the agent's first confident answer instead of letting a
+    # noisy advisory silently replace a good one (Phase 2b.1).
+    candidates: list[tuple[list[str], bool]] = []
 
     for step in range(budget.max_steps):
         state.steps_used = step + 1
@@ -176,14 +243,57 @@ def run_example(
                     tool_call=ToolCall(name=name, args=args),
                     observation=Observation(step=step, tool_call=ToolCall(name=name, args=args), tool_result=result),
                 ))
-            if result.terminate:
+            if result.terminate and name == "submit_answer" and result.ok:
+                candidate = list(state.current_answer or [])
+                vr = verify(
+                    verifier_client or client, example.utterance, candidate,
+                    table_view=_table_view(table_context),
+                    evidence_summary=_evidence_summary(state),
+                )
+                last_verify = vr.to_dict()
+                candidates.append((candidate, vr.ok))
+                if tracer:
+                    tracer.add(TraceEvent(
+                        step=step, kind="verify",
+                        note=f"ok={vr.ok} src={vr.source} issues={vr.issues[:3]} hint={vr.fix_hint[:120]}",
+                    ))
+                if not vr.ok and verify_retries < budget.max_verify_retries:
+                    verify_retries += 1
+                    # Keep the candidate in the pool; clear current so the model
+                    # must resubmit (it may re-confirm the same answer).
+                    state.current_answer = None
+                    messages[-1]["content"] = (
+                        (result.content_text or "")
+                        + "\n\n(Verification flagged a concern — see below. Re-check then resubmit.)"
+                    )
+                    messages.append({"role": "user", "content": build_verify_feedback(vr)})
+                else:
+                    terminated = True
+                    if not vr.ok:
+                        # Out of retries and the last answer still failed verify:
+                        # don't trust it. Let finalize fall back to the candidate
+                        # pool (last passed, else first confident submission).
+                        state.current_answer = None
+            elif result.terminate:
                 terminated = True
         if terminated:
             break
 
     # ---- Finalize (always produce something) ----
-    items = state.current_answer
+    # Selection policy (Phase 2b.1): prefer the LAST candidate that passed
+    # verification; if none ever passed, fall back to the FIRST submitted
+    # candidate (the agent's initial confident answer) — this neutralises a
+    # noisy advisory that talked the agent out of a good answer.
+    items: Optional[list[str]] = None
     source = "submit_answer"
+    passed = [c for c, ok in candidates if ok]
+    if state.current_answer is not None:
+        items = state.current_answer  # last submit that terminated the loop
+    elif passed:
+        items, source = passed[-1], "verified_candidate"
+    elif candidates:
+        items, source = candidates[0][0], "first_candidate"
+
     if items is None:
         if last_run_items:
             items, source = last_run_items, "last_run_python"
@@ -199,7 +309,12 @@ def run_example(
     items = normalize_items(items or [], example.utterance)
 
     evidence = dict(state.evidence)
-    evidence.update({"answer_source": source, "steps_used": state.steps_used, "terminated": terminated})
+    evidence.update({"answer_source": source, "steps_used": state.steps_used,
+                     "terminated": terminated, "skills": skills_used,
+                     "verify_retries": verify_retries,
+                     "candidates": [c for c, _ in candidates]})
+    if last_verify is not None:
+        evidence["verify"] = last_verify
     pred = Prediction(
         id=example.id,
         items=items or [],

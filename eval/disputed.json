@@ -1,0 +1,7 @@
+{
+  "_comment": "Examples whose gold answer is ambiguous/inconsistent with the question. These are EXCLUDED from 'adjusted' accuracy (raw accuracy still reported). Keep this list conservative and always record a reason + evidence.",
+  "disputed": {
+    "nt-1470": "Q asks 'how many teams played on 14 Feb 1976' but gold=7 counts the number of matches/ties that day; 14 (teams = 7 ties x 2) is at least as defensible.",
+    "nt-9465": "Q asks 'how does brazil RANK in average receipts per visitor' but gold=1,147 is the receipts-per-visitor VALUE, not a rank."
+  }
+}

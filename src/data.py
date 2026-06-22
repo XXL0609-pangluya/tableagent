@@ -6,6 +6,7 @@ so we defer all casting to the agent's generated pandas code.
 """
 from __future__ import annotations
 
+import json
 import os
 import random
 from typing import Optional
@@ -16,7 +17,20 @@ from .evaluator import tsv_unescape, tsv_unescape_list
 from .schemas import Example, TableContext
 
 # Default dataset root relative to repo root.
-DEFAULT_DATASET_ROOT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "WikiTableQuestions")
+_REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+DEFAULT_DATASET_ROOT = os.path.join(_REPO_ROOT, "WikiTableQuestions")
+DEFAULT_DISPUTED_PATH = os.path.join(_REPO_ROOT, "eval", "disputed.json")
+
+
+def load_disputed(path: str = DEFAULT_DISPUTED_PATH) -> dict[str, str]:
+    """Load ids of examples with ambiguous/inconsistent gold answers (id -> reason).
+
+    These are excluded from 'adjusted' accuracy so a buggy benchmark item doesn't
+    penalise the system. Returns {} if the file is absent."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf8") as f:
+        return dict(json.load(f).get("disputed", {}))
 
 
 def load_examples(split_basename: str, dataset_root: str = DEFAULT_DATASET_ROOT) -> list[Example]:
@@ -128,10 +142,25 @@ def sample_examples(
     return rng.sample(examples, n)
 
 
-# The original quick set (used for the first 200-example measurement).
+# Evaluation subset seeds (each holdout excludes all prior subsets).
 QUICK_SEED = 13
 QUICK_SET_SIZE = 200
 FRESH_SEED = 29
+HOLDOUT_SEED = 41
+
+
+def _subset_ids(examples: list[Example], which: str) -> set[str]:
+    if which == "quick":
+        return {e.id for e in sample_examples(examples, QUICK_SET_SIZE, QUICK_SEED)}
+    if which == "fresh":
+        quick = _subset_ids(examples, "quick")
+        pool = [e for e in examples if e.id not in quick]
+        return {e.id for e in sample_examples(pool, QUICK_SET_SIZE, FRESH_SEED)}
+    if which == "holdout":
+        used = _subset_ids(examples, "quick") | _subset_ids(examples, "fresh")
+        pool = [e for e in examples if e.id not in used]
+        return {e.id for e in sample_examples(pool, QUICK_SET_SIZE, HOLDOUT_SEED)}
+    raise ValueError(f"unknown eval subset: {which!r}")
 
 
 def eval_subset(
@@ -139,14 +168,10 @@ def eval_subset(
 ) -> list[Example]:
     """Return an evaluation subset.
 
-    which="quick": the original quick set (sample with QUICK_SEED), first n.
-    which="fresh": a disjoint held-out subset (excludes the quick-200 ids) so we
-                   can re-measure on data the agent was not tuned against.
+    which="quick":   original quick set (seed=13).
+    which="fresh":   disjoint from quick (seed=29).
+    which="holdout": disjoint from quick+fresh (seed=41) — use for new test runs.
     """
-    if which == "quick":
-        return sample_examples(examples, QUICK_SET_SIZE, QUICK_SEED)[:n]
-    if which == "fresh":
-        quick_ids = {e.id for e in sample_examples(examples, QUICK_SET_SIZE, QUICK_SEED)}
-        pool = [e for e in examples if e.id not in quick_ids]
-        return sample_examples(pool, n, FRESH_SEED)
-    raise ValueError(f"unknown eval subset: {which!r} (use 'quick' or 'fresh')")
+    ids = _subset_ids(examples, which)
+    ordered = [e for e in examples if e.id in ids]
+    return ordered[:n]

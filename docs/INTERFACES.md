@@ -100,8 +100,37 @@
 - `run_example(example, table_context, registry, client, prompts, budget=None, tracer=None) -> Prediction`
 - 兜底顺序：submit_answer → 最后一次 run_python 的 answer_items → 最后文本 → 空。
 
+## `src/verifier.py` — Phase 2c table-aware + independent-model verify [2c]
+- **独立模型**：verifier 用 `load_verifier_config()` 选的模型，刻意≠solver（默认
+  solver=qwen → verifier=deepseek-v4-flash），避免同模型同源盲点。`run_example` 收
+  `verifier_client`；脚本里只建一次。
+- `verify(client, question, items, *, table_view, evidence_summary, use_llm=True) -> VerifyResult{ok, issues, fix_hint, source, axis, model}`
+  - tier 1 `deterministic_issues`：anchor-inclusion（"other than/same as (X)"，含前缀子串匹配）、cardinality（单答却≥3项）。高精度、无 LLM。
+  - tier 2 `llm_check(...)`：**带 `table_view`**（schema+前~30行），重新审题并带入答案查表，按三维判断——
+    - **A 形式/精度**：是否逐字照抄单元格（不擅自四舍五入/加减单位/展开缩写/拆掉多段单元格）。
+    - **B 意图**：答案类型对不对（名称 vs 数值；单值 vs 列表）。
+    - **C 计数/聚合**：去重、空/"–"单元格、Total/汇总行的处理。
+  - 仍**不直接断言替换值**，只指出维度+该复查什么（保留 2b 反向伤害修复）。
+  - 注意：deepseek 等推理模型 CoT 会吃 token，`max_tokens=1024` 留足正文余量。
+- `build_verify_feedback(vr) -> str` — 含 `Axis X` 提示的复查 prompt。
+- Agent 在 `submit_answer` 后调用 verify；≤1 retry（`Budget.max_verify_retries`）。
+## 争议题剔除 [2c]
+- `eval/disputed.json`（tracked）：`{"disputed": {id: reason}}`，记录 gold 本身有歧义/与题不符的样本。
+- `data.load_disputed() -> {id: reason}`。
+- `evaluator.evaluate(preds, targets, exclude_ids=...)` 同时报 **raw** 与 **adjusted**（剔除争议题）准确率 + `num_excluded_disputed`；run 脚本两个数都打印、都存进 JSON。透明起见 raw 永远保留。
+- 当前已标：nt-1470（队数 vs 场次）、nt-9465（名次 vs 数值）；独立 verifier 自检也把 nt-1470 的 gold 判为可疑，旁证标记合理。
+
+## `src/verifier.py` 候选池
+- **Candidate pool (agent.py)**: every submit is kept with its pass flag; finalize
+  picks the last *passed* candidate, else the *first* submitted (so a noisy advisory
+  can't replace a good answer). Recorded in `evidence.candidates` / run-row `candidates`.
+
+## `src/analysis.py` — post-run error analysis [2b]
+- `load_run_rows`, `load_traces_jsonl`, `compare_buckets`, `format_example_report`, `format_bucket_from_runs`
+- Used by `scripts/diagnose.py`, `scripts/compare_runs.py`, `scripts/inspect_traces.py`, `scripts/analyze.py`
+
 ## 待建模块（接口先占位，Phase 推进时填实现）
-- `src/verifier.py` [1 宽松→2 严格]：`verify(state, answer) -> VerifyResult{ok, qtype, diagnostics}`（分类型）。
-- `src/router.py` [2]：`route(utterance) -> list[skill_name]`。
+- ~~`src/verifier.py`~~ ✅ Phase 2b lightweight verify
+- ~~`src/router.py`~~ ✅ keyword skill router lives in `src/agent.py` (`select_skills`)
 - `src/consistency.py` [2]：`vote(trajectory_answers) -> (items, confidence)`（按 evaluator 归一化投票）。
 - `src/run.py` [0.5+]：批量跑数据集 → 预测文件 + trace + 指标 + run manifest。

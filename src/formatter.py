@@ -7,6 +7,7 @@ List answers in WTQ are separated by '|'.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -28,6 +29,18 @@ def parse_answer_text(text: str) -> list[str]:
     text = text.strip()
     if not text:
         return []
+
+    # Model emitted a textual tool call like submit_answer(["3"]) / submit_answer(items=[...]).
+    m = re.search(r"submit_answer\(\s*(?:items\s*=\s*)?(\[.*\]|\"[^\"]*\"|'[^']*'|[^)]*)\)", text, re.DOTALL)
+    if m:
+        inner = m.group(1).strip()
+        try:
+            arr = json.loads(inner)
+            if isinstance(arr, list):
+                return [_strip_item(str(x)) for x in arr if str(x).strip()]
+            return [_strip_item(str(arr))]
+        except json.JSONDecodeError:
+            return [_strip_item(inner)]
 
     # JSON array?
     if text.startswith("["):
@@ -61,6 +74,35 @@ def _looks_yesno(question: str) -> bool:
     return q.startswith(_YESNO_STARTS)
 
 
+def _strip_count_unit(s: str, question: str) -> str:
+    """For count questions, drop a trailing unit that just echoes the question's
+    own noun: "what number of acts" + "5 acts" -> "5".
+
+    High precision: only fires when the trailing word matches the noun right after
+    'how many' / 'number of' in the question (so it won't touch gold-style units
+    like "2 years" for a "how long" question)."""
+    m = re.search(r"\b(?:how many|number of)\s+([a-z]+)", question.lower())
+    if not m:
+        return s
+    noun = m.group(1).rstrip("s")
+    m2 = re.match(r"^(\d[\d,]*)\s+([A-Za-z]+)$", s.strip())
+    if m2 and m2.group(2).lower().rstrip("s") == noun:
+        return m2.group(1)
+    return s
+
+
+def _strip_venue_prefix(s: str, question: str) -> str:
+    """Drop an away-game venue marker: "at New York Titans" -> "New York Titans".
+
+    Gated on opponent/team/who-style questions so it only applies to schedule
+    tables where 'at' marks an away game, not part of the name."""
+    ql = question.lower()
+    if not re.search(r"\b(opponent|team|who|which|whom|play(?:ed)?|beat|defeat|lose|lost|tie|won|win)\b", ql):
+        return s
+    m = re.match(r"^(?:at|vs\.?|@)\s+([A-Z].*)$", s.strip())
+    return m.group(1).strip() if m else s
+
+
 def normalize_items(items: list[str], question: str = "") -> list[str]:
     """Light, lossless-ish answer cleanup before grading.
 
@@ -92,6 +134,8 @@ def normalize_items(items: list[str], question: str = "") -> list[str]:
             s = s.split("\n", 1)[0].strip()
         if len(s) > 1 and s[0] == "#" and s[1:].lstrip().isdigit():
             s = s[1:].strip()
+        s = _strip_count_unit(s, question)
+        s = _strip_venue_prefix(s, question)
         if s:
             out.append(s)
     return out
