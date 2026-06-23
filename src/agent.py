@@ -138,6 +138,18 @@ def _evidence_summary(state: AgentState) -> str:
     return " | ".join(parts)[:600] if parts else "(none)"
 
 
+def _code_signature(code: str) -> str:
+    """Normalize run_python code for near-duplicate detection: strip comments,
+    blank lines, and whitespace so cosmetic edits don't dodge the check."""
+    lines = []
+    for raw in (code or "").splitlines():
+        line = raw.split("#", 1)[0]            # drop trailing comments
+        line = re.sub(r"\s+", "", line)        # collapse all whitespace
+        if line:
+            lines.append(line)
+    return "\n".join(lines).lower()
+
+
 def _table_view(tc: TableContext, max_rows: int = 30, max_chars: int = 2500) -> str:
     """Compact table rendering for the verifier to inspect (schema + rows)."""
     lines = [tc.schema_text, "", "Rows:"]
@@ -181,9 +193,14 @@ def run_example(
     candidates: list[tuple[list[str], bool]] = []
     # Code history for the auditor: list of (code, output) strings from run_python calls.
     code_history_parts: list[str] = []
-    # Phase 3b: mutable step ceiling
+    # Anti-spiral: normalized signatures of recent run_python code, to detect when the
+    # model re-runs near-identical code without reading the previous output.
+    recent_code_sigs: list[str] = []
+    # Phase 3b/3c: mutable step ceiling; debate tracking
     effective_max_steps = budget.max_steps
     debate_rounds_granted = 0
+    # Multi-round debate: track the concern raised in each round for follow-up context
+    last_debate_concern: str = ""
 
     step = 0
     while step < effective_max_steps:
@@ -230,22 +247,42 @@ def run_example(
                 args = {}
             result = execute_tool(registry, name, args, state)
 
-            if name == "run_python" and result.ok:
-                items_rp = result.structured.get("answer_items")
-                if items_rp:
-                    last_run_items = items_rp
-                # Record for auditor: code + truncated output
-                code_snippet = args.get("code", "")[:600]
-                output_snippet = (result.content_text or "")[:300]
-                step_label = f"=== run_python step {len(code_history_parts) + 1} ==="
-                code_history_parts.append(
-                    f"{step_label}\n{code_snippet}\n--- output ---\n{output_snippet}"
-                )
+            spiral_nudge = ""
+            if name == "run_python":
+                # Anti-spiral: did the model just re-run essentially the same code?
+                sig = _code_signature(args.get("code", ""))
+                if sig and sig in recent_code_sigs:
+                    spiral_nudge = (
+                        "\n\n[LOOP DETECTED] You just ran essentially the same code as a "
+                        "previous step. Re-running identical code will not change the result. "
+                        "STOP and do something different:\n"
+                        "  • Read the output/error ABOVE carefully — what did it actually say?\n"
+                        "  • If it errored, fix the specific cause (e.g. wrong column name, "
+                        "type/encoding, a soft-hyphen or special char in a header).\n"
+                        "  • If it returned data, that IS your evidence — interpret it and "
+                        "either submit_answer or try a GENUINELY different approach "
+                        "(different column, cast types, strip units, inspect raw rows).\n"
+                        "  • Do not repeat the same query a third time."
+                    )
+                if sig:
+                    recent_code_sigs.append(sig)
+
+                if result.ok:
+                    items_rp = result.structured.get("answer_items")
+                    if items_rp:
+                        last_run_items = items_rp
+                    # Record for auditor: code + truncated output
+                    code_snippet = args.get("code", "")[:600]
+                    output_snippet = (result.content_text or "")[:300]
+                    step_label = f"=== run_python step {len(code_history_parts) + 1} ==="
+                    code_history_parts.append(
+                        f"{step_label}\n{code_snippet}\n--- output ---\n{output_snippet}"
+                    )
 
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": result.content_text or (result.error or "(no output)"),
+                "content": (result.content_text or (result.error or "(no output)")) + spiral_nudge,
             })
             if tracer:
                 tracer.add(TraceEvent(
@@ -262,6 +299,8 @@ def run_example(
                     table_view=_table_view(table_context),
                     evidence_summary=_evidence_summary(state),
                     code_history=code_history,
+                    debate_round=verify_retries + 1,       # round 1 = fresh audit
+                    previous_concern=last_debate_concern,  # empty on round 1
                 )
                 last_verify = vr.to_dict()
                 candidates.append((candidate, vr.ok))
@@ -271,6 +310,9 @@ def run_example(
                         note=f"ok={vr.ok} src={vr.source} issues={vr.issues[:2]}",
                     ))
                 if not vr.ok and verify_retries < budget.max_verify_retries:
+                    # Record the concern so the next round's follow-up audit can
+                    # reference it (multi-round debate memory).
+                    current_concern = "; ".join(vr.issues) if vr.issues else (vr.fix_hint or "")
                     verify_retries += 1
                     # Keep the candidate in the pool; clear current so the model
                     # must resubmit (it may re-confirm the same answer).
@@ -279,12 +321,18 @@ def run_example(
                         (result.content_text or "")
                         + "\n\n(Verification flagged a concern — see the debate prompt below.)"
                     )
-                    # Phase 3b: use the full debate prompt (with verifier code evidence)
-                    # when compute evidence is available; simpler text-only prompt otherwise.
+                    # Phase 3b/3c: full debate prompt when audit code is available;
+                    # simpler text-only prompt otherwise.
                     if vr.verifier_code:
-                        feedback = build_debate_prompt(vr, candidate)
+                        feedback = build_debate_prompt(
+                            vr, candidate,
+                            debate_round=verify_retries,
+                            previous_concern=last_debate_concern,
+                        )
                     else:
                         feedback = build_verify_feedback(vr)
+                    # Record for next round's follow-up context.
+                    last_debate_concern = current_concern
                     messages.append({"role": "user", "content": feedback})
                     # Grant extra steps for this debate round (once per retry).
                     if debate_rounds_granted < verify_retries:
@@ -293,8 +341,9 @@ def run_example(
                         if tracer:
                             tracer.add(TraceEvent(
                                 step=step, kind="debate_start",
-                                note=f"granted +{budget.debate_extra_steps} steps "
-                                     f"(effective_max={effective_max_steps})",
+                                note=f"round={verify_retries} granted +{budget.debate_extra_steps} steps "
+                                     f"(effective_max={effective_max_steps}) "
+                                     f"concern={current_concern[:80]}",
                             ))
                 else:
                     terminated = True
@@ -313,17 +362,19 @@ def run_example(
     # Prefer the EARLIEST verified candidate: the first confident answer is
     # more trustworthy than one produced under debate-round pressure.
     # Fallback chain: last clean submit → first verified → first candidate → run_python → forced.
+    # NOTE: an empty list ([]) counts as "no answer" — we never want to return empty
+    # if the generator ever produced a non-empty answer (empty-answer guardrail).
     items: Optional[list[str]] = None
     source = "submit_answer"
-    passed = [c for c, ok in candidates if ok]
-    if state.current_answer is not None:
+    passed = [c for c, ok in candidates if ok and c]
+    if state.current_answer:                       # truthy = non-empty
         items = state.current_answer
     elif passed:
         items, source = passed[0], "first_verified"
-    elif candidates:
-        items, source = candidates[0][0], "first_candidate"
+    elif any(c for c, _ in candidates):
+        items, source = next(c for c, _ in candidates if c), "first_candidate"
 
-    if items is None:
+    if not items:
         if last_run_items:
             items, source = last_run_items, "last_run_python"
         else:
@@ -332,8 +383,15 @@ def run_example(
                 items, source = forced, "forced_final"
             elif last_text:
                 items, source = parse_answer_text(last_text), "last_text"
-            else:
-                items, source = [], "empty_fallback"
+
+    # Empty-answer guardrail: if we STILL have nothing, fall back to ANY non-empty
+    # answer the generator produced this run rather than submitting [].
+    if not items:
+        salvage = next((c for c, _ in candidates if c), None) or last_run_items
+        if salvage:
+            items, source = salvage, "nonempty_salvage"
+        else:
+            items, source = [], "empty_fallback"
 
     items = normalize_items(items or [], example.utterance)
 

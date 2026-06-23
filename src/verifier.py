@@ -38,10 +38,14 @@ class VerifyResult:
     model: str = ""
     recomputed: list[str] = field(default_factory=list)  # verifier's own answer (compute tier)
     compute_match: Optional[bool] = None  # True=agreed, False=disagreed, None=abstained/no df
-    # Code evidence the verifier actually executed — surfaced to the generator in debate mode
-    # so the generator can read it, judge it, and run counter-code instead of just capitulating.
+    # Audit evidence surfaced to the generator in debate mode.
+    # verifier_code    — one-liner pandas snippet the generator should run to test the claim
+    # verifier_stdout  — output from any code the verifier ran itself (currently unused)
+    # verifier_reasoning — full natural-language explanation of WHY the auditor suspects a flaw
+    #   (table observations, logical chain); shown to the generator alongside the test code
     verifier_code: str = ""
     verifier_stdout: str = ""
+    verifier_reasoning: str = ""
     raw: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -90,6 +94,79 @@ def _expects_single(question: str) -> Optional[bool]:
     return None
 
 
+def _expects_exactly_one(question: str) -> bool:
+    """Strict singular phrasing: the answer must be a SINGLE item.
+    High precision — used to flag multi-item answers to clearly-singular questions."""
+    q = question.strip().lower()
+    if re.search(r"\b(list|name all|which ones|what are all|all of|which.*\bare\b)\b", q):
+        return False
+    # explicit singular markers
+    if re.search(r"\bthe (only|first|last|single|sole)\b", q):
+        return True
+    if re.search(r"\b(who|whom|whose)\b", q):
+        return True
+    # "which/what <singular-noun>" anywhere — singular if the noun isn't plural
+    m = re.search(r"\b(which|what)\s+([a-z]+)\b", q)
+    if m:
+        noun = m.group(2)
+        if not noun.endswith("s") and noun not in ("is", "was", "are", "were", "many", "kind", "type"):
+            return True
+    return False
+
+
+# Nouns after which/what that ask for a NUMBER/temporal value, not an entity label.
+_NUMERIC_NOUNS = (
+    "year", "number", "percentage", "percent", "amount", "count", "total",
+    "time", "score", "rank", "place", "position", "age", "size", "distance",
+    "difference", "average", "sum", "many", "much",
+)
+
+
+def _expects_label(question: str) -> Optional[bool]:
+    """True if the answer should be an ENTITY NAME (not a bare number)."""
+    q = question.strip().lower()
+    if re.search(r"\b(how many|how much|number of|what percentage|how often)\b", q):
+        return False
+    if re.match(r"^(when|how)\b", q):
+        return False
+    if re.search(r"\b(who|whom|whose)\b", q):
+        return True
+    if re.search(r"\bname (the|of|all)\b", q):
+        return True
+    m = re.search(r"\b(which|what)\s+([a-z]+)\b", q)
+    if m:
+        noun = m.group(2)
+        if noun in _NUMERIC_NOUNS:
+            return False
+        # skip copulas/auxiliaries/determiners — those aren't the entity noun
+        if noun in ("is", "was", "are", "were", "did", "does", "do", "has",
+                    "have", "had", "will", "would", "the", "a", "an"):
+            return None
+        return True  # "which monarch / what team ..." → wants an entity label
+    return None
+
+
+def answer_type_issues(question: str, items: list[str]) -> list[str]:
+    """B-axis (high precision): a question that clearly wants a NAME was answered with a
+    bare number. Catches argmax mistakes that return the measure instead of the label
+    (e.g. 'which entry had the least points?' answered '5' instead of the row's name)."""
+    if len(items) != 1:
+        return []
+    ans = items[0].strip()
+    if not ans or not _is_number(ans):
+        return []
+    # a 4-digit value could be a legitimate year answer; don't flag those
+    if re.fullmatch(r"\d{4}", ans):
+        return []
+    if _expects_label(question) is True:
+        return [
+            f"The question asks for a name/label but the answer '{ans}' is a bare number. "
+            "If this is an argmax question ('which/who had the most/least X'), return the "
+            "ROW LABEL (the name), not the value of X."
+        ]
+    return []
+
+
 def _is_number(s: str) -> bool:
     try:
         float(s.replace(",", "").strip())
@@ -132,6 +209,57 @@ def cell_substring_issues(items: list[str], df: "pd.DataFrame") -> list[str]:
     ]
 
 
+def _norm_num(s: str) -> str:
+    """Strip thousands separators and surrounding spaces for numeric comparison."""
+    return re.sub(r"[,\s]", "", s.strip())
+
+
+def format_drift_issues(items: list[str], df: "pd.DataFrame") -> list[str]:
+    """A-axis (high precision): the answer is the SAME value as a real cell but with
+    the FORMATTING stripped/changed. WTQ wants the cell's exact text.
+
+    Catches e.g. answer '15.5' when a cell is '15.5%'; answer '1200' when the cell is
+    '1,200'; answer 'USA' when a cell is 'USA*'. Conservative: only single-item answers,
+    and only when a cell is exactly the answer plus a short unit/symbol wrapper.
+    """
+    if len(items) != 1:
+        return []
+    ans = items[0].strip()
+    if not ans:
+        return []
+    ans_l = ans.lower()
+    ans_num = _norm_num(ans)
+    for col in df.columns:
+        for val in df[col].astype(str).unique():
+            v = val.strip()
+            if not v or v.lower() == ans_l:
+                return []  # exact cell match somewhere -> answer is already correct format
+    candidates: set[str] = set()
+    for col in df.columns:
+        for val in df[col].astype(str).unique():
+            v = val.strip()
+            vl = v.lower()
+            if not v or vl == ans_l:
+                continue
+            # (a) cell = answer + a trailing SYMBOL/unit. Restricted to high-precision
+            # symbols (%, $, *, °) so we never mis-flag a count like '5' against '5th'.
+            if vl.startswith(ans_l) and 0 < len(vl) - len(ans_l) <= 3:
+                tail = v[len(ans):].strip()
+                if tail and re.fullmatch(r"[%\$\*°]+", tail):
+                    candidates.add(v)
+            # (b) same number, different separators/decimals (1200 vs 1,200)
+            elif ans_num and _norm_num(v) == ans_num and any(ch.isdigit() for ch in ans):
+                candidates.add(v)
+    if not candidates:
+        return []
+    sample = sorted(candidates)[:3]
+    return [
+        f"Your answer '{ans}' matches a table cell except for formatting (cells like "
+        f"{sample}). WTQ answers copy the cell EXACTLY — keep the unit/symbol/separators "
+        f"as shown (e.g. keep '%', keep '1,200'). Resubmit using the cell's exact text."
+    ]
+
+
 def deterministic_issues(question: str, items: list[str]) -> list[str]:
     issues: list[str] = []
     if not items:
@@ -149,11 +277,20 @@ def deterministic_issues(question: str, items: list[str]) -> list[str]:
                     "questions like 'other than / same as (X)' should EXCLUDE it and return only the OTHERS."
                 )
                 break
-    if _expects_single(question) is True and len(items) >= 3:
+    # C-axis: list vs single. Strict-singular phrasing → flag even 2 items;
+    # otherwise keep the looser >=3 guard to avoid false alarms.
+    if _expects_exactly_one(question) and len(items) >= 2:
+        issues.append(
+            f"The question expects a SINGLE answer but {len(items)} items were returned: {items}. "
+            "Pick the one the question asks for (e.g. the first/only/top match)."
+        )
+    elif _expects_single(question) is True and len(items) >= 3:
         issues.append(
             f"The question seems to expect a single answer but {len(items)} items were returned: {items}. "
             "Re-check whether the filter is too broad."
         )
+    # B-axis: wants a name/label but got a bare number.
+    issues += answer_type_issues(question, items)
     return issues
 
 
@@ -162,27 +299,53 @@ def deterministic_issues(question: str, items: list[str]) -> list[str]:
 # --------------------------------------------------------------------------
 
 _LLM_SYSTEM = """You are an INDEPENDENT verifier for table question answering. You
-are a different model from the one that produced the answer. Re-read the question
-carefully, look at the table, and judge whether the proposed answer is correct
-along THREE axes:
+are a different model from the one that produced the answer. The solver worked
+directly with this table and is PRESUMED CORRECT. Your job is to catch clear,
+objective mistakes — NOT to impose your own reading of an ambiguous question.
+
+Check the answer along THREE axes:
 
 A. FORM / PRECISION — Is each answer item copied EXACTLY as it appears in the
-   relevant table cell? Flag if the answer rounds a number the table didn't round,
-   adds/removes a unit, expands an abbreviation (e.g. "United States" when the cell
-   says "USA"), or drops part of a multi-part cell (e.g. a name that also carries
-   dates/qualifiers).
-B. INTENT — Does the answer TYPE match what the question asks? A question wanting a
-   name/label must not be answered with a number (and vice versa); a single-answer
-   question must not return a list.
-C. COUNTING / AGGREGATION — For counts/sums/averages/extremes, were duplicates
-   de-duplicated when needed, blank or "–"/"—" cells handled, and any Total/summary
-   row excluded (or included) as the question requires?
+   relevant table cell? The gold answer almost always uses the TABLE'S OWN format. Flag if:
+   - a number is rounded/reformatted differently from the cell (e.g. "15.5" when the
+     cell says "15.5%", "1200" when the cell says "1,200", zero-padded "0:02:14" when
+     the natural value is "2:14") — keep units, symbols, separators, and minimal format;
+   - a unit/symbol is added or removed (%, $, *, °);
+   - an abbreviation is expanded (e.g. "United States" when the cell says "USA");
+   - a non-English title is TRANSLATED or romanized when the question asks for the title:
+     return the ORIGINAL-script cell (e.g. the "Episode title" column), NOT a separate
+     "Translation"/"Romanized" column, unless the question explicitly asks for that;
+   - part of a multi-part cell is dropped (e.g. a name that also carries dates/qualifiers).
+B. INTENT — Does the answer TYPE match what the question asks?
+   - A question wanting a name/label must not be answered with a number (and vice versa).
+   - ARGMAX questions ("which/who had the most/least/highest/lowest X") want the ROW
+     LABEL (the name), NOT the value of X. Flag "5" when the answer should be the entry
+     whose points were 5.
+   - "what is the highest/largest X" when X identifies an item (e.g. "highest percentage
+     of speakers other than Polish") usually wants the ITEM (the language/name), not the
+     number — read what the gold-style answer should be.
+   - A singular question ("who", "the only/first X", "which <singular noun>") must return
+     exactly ONE item, not a list. A clearly plural/"all" question may return several.
+C. COUNTING / AGGREGATION — For counts/sums/averages/extremes, is there an OBJECTIVE
+   mistake — e.g. a Total/summary row wrongly included, or a clearly double-counted row?
 
-Rules:
-- Use the table to judge; do NOT invent rows or values you cannot see.
-- If the answer is fine on all three axes, pass.
-- If not, name the single most important axis (A/B/C) and say briefly what to
-  re-check. Do NOT just assert a replacement number — describe the check.
+═══ INTERPRETATION GUARD (read before flagging) ═══
+This dataset uses NATURAL, EVERYDAY phrasing. Take the question at face value with
+common-sense interpretation. You MUST NOT flag an answer merely because YOU would
+interpret the question differently. In particular, these are the SOLVER's call, not
+yours — do NOT flag them:
+- "majority / most" → the option that occurs most often (plurality). Do NOT demand
+  strictly more than 50%.
+- "how many / total number of X" → usually the COUNT OF ROWS matching X. Do NOT
+  demand de-duplication unless the question literally says "distinct"/"different".
+- "next / previous / after / before X (listed)" → the ADJACENT ROW in the table's
+  given order (positional), NOT chronological order, unless the question says "earliest"/
+  "latest"/"chronologically".
+- ordering, ties, inclusive/exclusive ranges when the question is silent → trust the solver.
+
+ONLY flag when you are highly confident the answer is OBJECTIVELY wrong (wrong cell,
+wrong column, a number that contradicts the visible table, a Total row included by
+mistake, or a clear form/precision error). When in doubt, PASS.
 
 Respond with JSON only:
 {"pass": true|false, "axis": "A"|"B"|"C"|null, "issue": "short", "fix_hint": "what to re-check"}
@@ -258,29 +421,74 @@ You will receive:
 3. The student's proposed answer
 4. The student's run_python steps (code + outputs)
 
-Your job: find ONE specific, concrete flaw in the student's code or reasoning, if any. 
+Your job: find ONE specific, concrete flaw in the student's code or reasoning, if any.
 
-VALID flaws to flag (all pointing to a specific step):
-- Wrong aggregation: "Step 2 used .count() but the question needs .nunique() for distinct values"
-- Missing exclusion: "Step 3 didn't filter out the Total/summary row (e.g. row where Name='Total')"
+VALID flaws to flag (a concrete, OBJECTIVE mechanical error in a specific step):
 - Wrong column: "Step 1 filtered by column 'Winner' but the question asks about 'Runner-up'"
-- Off-by-one: "Step 2's date filter is >= instead of >, including the boundary date itself"
+- Total row included: "Step 3 summed all rows including the 'Total' row, double-counting"
 - Truncated cell: "The answer '4x400 m' is a substring of cell '4x400 m relay' — use the full cell"
-- Type mismatch: "The answer is a number but the question asks for a name/label"
+- Type mismatch: "The answer is a number but the question clearly asks for a name/label"
+- Code bug: the code crashed, used the wrong variable, or its printed output contradicts the answer
+
+═══ INTERPRETATION GUARD — DO NOT cross this line ═══
+This dataset uses NATURAL, EVERYDAY phrasing. The student worked directly with the
+table and OWNS the interpretation of ambiguous wording. You must NOT flag a step
+merely because YOU would interpret the question differently. Specifically, these are
+NOT flaws — treat them as the student's correct call:
+- "majority / most" meaning the most frequent option (plurality), not strictly >50%.
+- "how many / total number of X" meaning a COUNT OF ROWS, not distinct/unique values
+  (unless the question literally says "distinct" / "different").
+- "next / after / before (listed)" meaning the ADJACENT ROW in the given order, not
+  chronological order (unless the question says "earliest"/"latest"/"chronologically").
+- choosing .count() vs .nunique(), >= vs >, inclusive vs exclusive when the question
+  is SILENT — the student decides; do NOT flag.
 
 INVALID — do NOT do these:
 - Do NOT compute the answer yourself from scratch
+- Do NOT flag a "wrong aggregation" or "missing de-dup" that is really just YOUR
+  alternate reading of an ambiguous question (see the guard above)
 - Do NOT say "the answer should be X" without pointing to a specific flawed step
 - Do NOT invent flaws; if the student's work looks sound, say it passes
-- Do NOT flag stylistic issues — only flag logical/factual errors
+- Do NOT flag stylistic issues — only flag objective logical/factual errors
+
+When in doubt, set "flawed": false. A false alarm that overturns a correct answer is
+much worse than letting a borderline answer stand.
 
 Respond with JSON only:
 {
   "flawed": true|false,
   "step": "which step is flawed, e.g. 'run_python step 2' or 'final answer format'",
-  "flaw": "one sentence describing the concrete error",
-  "test": "one line of pandas code the student can run to verify this claim (or empty string)"
+  "flaw": "ONE sentence naming the concrete OBJECTIVE error (the headline)",
+  "reasoning": "2-4 sentences explaining the evidence: what you see in the table vs what the code does, why this is OBJECTIVELY wrong (not just a different interpretation)",
+  "test": "one line of pandas code the student can run to verify this claim (or empty string if not applicable)"
 }"""
+
+_AUDIT_FOLLOWUP_SYSTEM = """You are a meticulous code auditor in round {round} of a debate about a table question-answering answer.
+
+CONTEXT: In a previous round you raised a concern about the student's work. The student has since run
+additional code to respond to your challenge. The code history now includes BOTH the original steps
+AND their counter-code (the newer steps at the end).
+
+Your task:
+1. Review the student's counter-code carefully.
+2. If their counter-code ADDRESSES your previous concern: set "flawed": false and "resolution": "accepted".
+3. If their counter-code does NOT address the core issue, or reveals a NEW concrete flaw: flag it.
+   - Be specific: point to the counter-code step that fails or the original flaw that persists.
+   - Your previous concern was: {previous_concern}
+
+BIAS TOWARD ACCEPTANCE: If the student ran code that is logically plausible and reaches a consistent
+conclusion — even if you might have done it differently — accept their approach. Only reject if you
+can point to a CONCRETE logical error in their code.
+
+Respond with JSON only:
+{{
+  "flawed": true|false,
+  "resolution": "accepted"|"rejected"|"new_issue",
+  "step": "which step is still flawed (empty if accepted)",
+  "flaw": "ONE sentence naming the remaining/new error (empty if accepted)",
+  "reasoning": "2-4 sentences: why the counter-code does or does not resolve the concern, citing specific code lines or table values as evidence",
+  "test": "one line of pandas code to verify the remaining claim (or empty string)"
+}}"""
 
 
 def audit_check(
@@ -290,22 +498,45 @@ def audit_check(
     code_history: str,
     table_view: str = "",
     *,
+    debate_round: int = 1,
+    previous_concern: str = "",
     max_tokens: int = 1024,
 ) -> VerifyResult:
     """Audit the generator's own code history for a specific logical flaw.
 
+    In round 1: fresh audit looking for any flaw.
+    In round 2+: follow-up audit checking whether the generator's counter-code
+    addressed the previous concern. Biased toward acceptance in later rounds.
+
     Returns the flaw description + a one-liner test the generator can run to
     verify the claim. Does NOT compute a new answer.
     """
+    if debate_round <= 1:
+        system = _AUDIT_SYSTEM
+    else:
+        system = _AUDIT_FOLLOWUP_SYSTEM.format(
+            round=debate_round,
+            previous_concern=previous_concern or "(not recorded)",
+        )
+
+    round_note = ""
+    if debate_round > 1:
+        round_note = (
+            f"\n\n[Note: This is debate round {debate_round}. "
+            f"The newer code steps at the end of the history are the student's response "
+            f"to the previous concern: {previous_concern or '(see prior round)'}]"
+        )
+
     user = (
         f"Question: {question}\n\n"
         f"Student's proposed answer: {items}\n\n"
         f"Table sample:\n{table_view or '(not provided)'}\n\n"
-        f"Student's reasoning steps:\n{code_history or '(no code steps recorded)'}\n"
+        f"Student's reasoning steps:\n{code_history or '(no code steps recorded)'}"
+        f"{round_note}\n"
     )
     try:
         resp = client.chat(
-            messages=[{"role": "system", "content": _AUDIT_SYSTEM},
+            messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.0,
@@ -322,6 +553,7 @@ def audit_check(
 
     step_desc = str(parsed.get("step") or "").strip()
     flaw_desc = str(parsed.get("flaw") or "").strip()
+    reasoning = str(parsed.get("reasoning") or "").strip()
     test_code = str(parsed.get("test") or "").strip()
     if not flaw_desc:
         return VerifyResult(ok=True, source="none", model=client.config.model, raw=raw[:300])
@@ -330,8 +562,9 @@ def audit_check(
     return VerifyResult(
         ok=False, issues=[issue], source="audit",
         model=client.config.model,
-        verifier_code=test_code,   # reuse field: the test-code to reproduce the claim
-        fix_hint=f"Run: {test_code}" if test_code else "",
+        verifier_code=test_code,
+        verifier_reasoning=reasoning,
+        fix_hint=f"Run: {test_code}" if test_code else (reasoning[:120] if reasoning else ""),
         raw=raw[:300],
     )
 
@@ -350,32 +583,47 @@ def verify(
     evidence_summary: str = "",
     code_history: str = "",
     use_llm: bool = True,
+    debate_round: int = 1,
+    previous_concern: str = "",
 ) -> VerifyResult:
     """Three tiers, all running independently:
       1. deterministic rules (no model) — short-circuits on high-precision hits
       2. A/B/C dimensional review — checks answer quality (form, intent, counting)
       3. AUDIT of the generator's code history — finds specific logical flaws
          (does NOT re-answer; points to a concrete step and provides a test snippet)
+
+    In debate_round >= 2, the audit is run as a follow-up (checking whether the
+    generator's counter-code addressed the previous concern). Biased toward acceptance.
     """
     if not items:
         return VerifyResult(ok=True, source="none")
 
-    # Tier 1: deterministic (no model cost)
-    det = deterministic_issues(question, items)
-    if df is not None:
-        det += cell_substring_issues(items, df)
-    if det:
-        return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
+    # Tier 1: deterministic (no model cost) — only on round 1
+    if debate_round <= 1:
+        det = deterministic_issues(question, items)
+        if df is not None:
+            det += cell_substring_issues(items, df)
+            det += format_drift_issues(items, df)
+        if det:
+            return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
 
     if client is None or not use_llm:
         return VerifyResult(ok=True, source="none")
 
-    # Tier 2: A/B/C dimensional review (always on)
-    review = llm_check(client, question, items, table_view, evidence_summary)
+    # Tier 2: A/B/C dimensional review (skip in follow-up rounds — focus on audit)
+    review: VerifyResult
+    if debate_round <= 1:
+        review = llm_check(client, question, items, table_view, evidence_summary)
+    else:
+        review = VerifyResult(ok=True, source="none")
 
-    # Tier 3: audit the generator's code history for specific logical flaws
+    # Tier 3: audit — round 1 is fresh; round 2+ checks counter-code
     audit = (
-        audit_check(client, question, items, code_history, table_view)
+        audit_check(
+            client, question, items, code_history, table_view,
+            debate_round=debate_round,
+            previous_concern=previous_concern,
+        )
         if code_history else VerifyResult(ok=True, source="none")
     )
 
@@ -401,7 +649,8 @@ def verify(
         source=final_source,
         axis=axis,
         model=client.config.model,
-        verifier_code=audit.verifier_code,   # the test snippet from the audit
+        verifier_code=audit.verifier_code,
+        verifier_reasoning=audit.verifier_reasoning or review.fix_hint,
     )
 
 
@@ -413,46 +662,94 @@ _AXIS_HINT = {
 }
 
 
-def build_debate_prompt(vr: VerifyResult, solver_answer: list[str]) -> str:
-    """Debate-mode prompt: auditor presents a specific claim; generator evaluates it
-    critically with code, then decides. The generator's default stance is confidence
-    in its own derivation — only change if the specific claim is verified."""
-    lines = [
-        "═══ AUDITOR REPORT ═══",
-        f"An independent auditor (model: {vr.model}) reviewed your reasoning steps "
-        f"and raised a specific concern about your answer {solver_answer}.",
-        "",
-    ]
+def build_debate_prompt(
+    vr: VerifyResult,
+    solver_answer: list[str],
+    debate_round: int = 1,
+    previous_concern: str = "",
+) -> str:
+    """Debate-mode prompt shown to the generator after the auditor flags a concern.
 
-    # Show the specific audit finding
+    Structure:
+      1. Header — which round, which model, what answer is under scrutiny
+      2. Claim headline — one-sentence flaw description
+      3. Auditor's reasoning — natural-language evidence from the table / code
+      4. Verification code — the one-liner pandas test the generator should run
+      5. Instructions — maintain confidence, only change on code evidence
+    """
+    round_header = (
+        "═══ AUDITOR REPORT ═══"
+        if debate_round <= 1
+        else f"═══ AUDITOR ROUND {debate_round} RESPONSE ═══"
+    )
+    lines = [round_header]
+
+    if debate_round <= 1:
+        lines.append(
+            f"An independent auditor (model: {vr.model}) reviewed your reasoning steps "
+            f"and raised a specific concern about your answer {solver_answer}."
+        )
+    else:
+        lines += [
+            f"The auditor (model: {vr.model}) reviewed your counter-code and still "
+            f"has an unresolved concern about your answer {solver_answer}.",
+            f"Previous concern: {previous_concern or '(see round 1)'}",
+        ]
+
+    lines.append("")
+
+    # ── Claim headline ───────────────────────────────────────────────────────
     if vr.issues:
-        lines.append("Specific claim: " + "; ".join(vr.issues))
+        lines.append("▶ CLAIM: " + "; ".join(vr.issues))
     if vr.axis and vr.axis in _AXIS_HINT:
-        lines.append(f"Category: Axis {vr.axis} — {_AXIS_HINT[vr.axis]}")
+        lines.append(f"  Category: Axis {vr.axis} — {_AXIS_HINT[vr.axis]}")
 
-    # Show the test code if available
+    # ── Natural-language reasoning ────────────────────────────────────────────
+    if vr.verifier_reasoning:
+        lines += [
+            "",
+            "▶ AUDITOR'S REASONING:",
+            vr.verifier_reasoning,
+        ]
+
+    # ── Verification code ─────────────────────────────────────────────────────
     if vr.verifier_code:
         lines += [
             "",
-            "The auditor suggests running this targeted test to verify the claim:",
+            "▶ SUGGESTED TEST (run this to verify or refute the claim):",
             "```python",
             vr.verifier_code.strip(),
             "```",
         ]
 
+    # ── Instructions ─────────────────────────────────────────────────────────
     lines += [
         "",
-        "═══ YOUR TURN (you have extra steps) ═══",
+        f"═══ YOUR TURN — DEBATE ROUND {debate_round} (extra steps granted) ═══",
         "You are the expert who worked directly with this table.",
         "Default stance: your answer is PRESUMED CORRECT.",
         "",
-        "Run the test above (or equivalent code) and then decide:",
-        "  • If the test CONFIRMS the auditor's claim → fix the specific issue and resubmit.",
-        "  • If the test REFUTES the claim → resubmit your ORIGINAL answer with",
-        "    the test output as evidence. A single assertion without proof is not enough",
-        "    to change your answer.",
+        "FIRST, classify the auditor's claim:",
+        "  (a) A CONCRETE MECHANICAL ERROR — wrong column, a number that contradicts",
+        "      the table, a Total row included by mistake, a truncated cell, code that",
+        "      crashed. These are objective and worth testing.",
+        "  (b) A DIFFERENT INTERPRETATION of the question — e.g. 'majority means >50%',",
+        "      'should be distinct count', 'should be chronological order'. The question's",
+        "      meaning is YOUR call as the on-the-ground expert. Re-read the EXACT wording:",
+        "        - 'majority/most' = the most frequent option (you do NOT need >50%).",
+        "        - 'how many / total number' = count of matching ROWS (NOT distinct,",
+        "          unless the question literally says 'distinct'/'different').",
+        "        - 'next/after (listed)' = the adjacent ROW in table order (NOT chronological,",
+        "          unless it says 'earliest'/'latest').",
         "",
-        "Do not change your answer based on the auditor's words alone — only on code evidence.",
+        "DECISION RULE:",
+        "  • If (b) interpretation dispute and the question wording supports YOUR reading →",
+        "    KEEP your original answer. Resubmit it and briefly state the wording you relied on.",
+        "    Computing a different quantity does NOT prove your answer wrong.",
+        "  • If (a) mechanical error → run the test. If it CONFIRMS a real bug, fix it and",
+        "    resubmit. If it REFUTES the claim, resubmit your ORIGINAL answer with the output.",
+        "",
+        "Do not abandon a correct answer just because the auditor computed a different number.",
     ]
     return "\n".join(lines)
 

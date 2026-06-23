@@ -2,6 +2,9 @@
   "_comment": "Examples whose gold answer is ambiguous/inconsistent with the question. These are EXCLUDED from 'adjusted' accuracy (raw accuracy still reported). Keep this list conservative and always record a reason + evidence.",
   "disputed": {
     "nt-1470": "Q asks 'how many teams played on 14 Feb 1976' but gold=7 counts the number of matches/ties that day; 14 (teams = 7 ties x 2) is at least as defensible.",
-    "nt-9465": "Q asks 'how does brazil RANK in average receipts per visitor' but gold=1,147 is the receipts-per-visitor VALUE, not a rank."
+    "nt-9465": "Q asks 'how does brazil RANK in average receipts per visitor' but gold=1,147 is the receipts-per-visitor VALUE, not a rank.",
+    "nt-11748": "Q asks 'what is the highest PERCENTAGE of speakers other than polish' (a number) but gold='Yiddish' is the language NAME, not a percentage. Question/answer type are inconsistent.",
+    "nt-9828": "Q asks 'average number of affiliates' — the true mean is 1.14, but gold='1'. Gold appears to floor/round inconsistently; 1.14 is the defensible average.",
+    "nt-8912": "Q asks 'which region has more than one format' but gold='United States' only; United States, The Netherlands AND Worldwide each appear with >1 distinct Format, so the gold is under-specified."
   }
 }
