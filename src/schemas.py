@@ -68,6 +68,7 @@ class Budget:
     max_steps: int = 6
     max_retries: int = 2
     max_verify_retries: int = 1  # Phase 2b: one correction pass after failed verify
+    debate_extra_steps: int = 3  # Phase 3b: extra steps granted per debate round
     max_tokens: Optional[int] = None
     step_timeout_s: float = 10.0
 

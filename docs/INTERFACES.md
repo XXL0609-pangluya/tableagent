@@ -100,6 +100,48 @@
 - `run_example(example, table_context, registry, client, prompts, budget=None, tracer=None) -> Prediction`
 - 兜底顺序：submit_answer → 最后一次 run_python 的 answer_items → 最后文本 → 空。
 
+## Phase 3b — 生成器/验证器讨论协议 [3b]
+
+### 设计思想
+之前的问题：verifier 发一段文字说"可能有问题"→生成器因为没有更强的反驳手段而盲目认错（见 nt-5881 回归）。
+
+新协议：**双方都必须拿代码上场，不能只靠说话改答案。**
+
+1. verifier 的检查结果（`VerifyResult`）现在保存它自己跑过的 pandas 代码（`verifier_code`）和 stdout（`verifier_stdout`）。
+2. 检查器 flag 时，如果有代码证据，agent 收到 `build_debate_prompt(vr, candidate)` ——这个 prompt 完整展示检查器的代码+结果，并明确要求生成器：
+   - **只跑代码之后才能改答案**（defend=跑自己的代码证明正确，然后 resubmit 原答案；accept=跑代码确认检查器逻辑，然后 resubmit 修正值）。
+   - 没有代码就不能改——这就堵住了"看到数字就认错"的盲目认错。
+3. **讨论步数**：每次 verify 触发时，`effective_max_steps += budget.debate_extra_steps`（默认 3），保证生成器有足够的步数跑代码、核查、再提交。
+4. 没有 compute 代码时（仅 A/B/C 文字反馈 / deterministic），退回到旧的简单 `build_verify_feedback`，不额外扩步数（开销更小）。
+
+### 接口变化
+- `VerifyResult`: 新增 `verifier_code: str`, `verifier_stdout: str`（`compute_check` 填充）。
+- `verifier.py`: `build_debate_prompt(vr, solver_answer) -> str`（新增）；`build_verify_feedback` 保留作非计算型 flag 的兜底。
+- `schemas.py`: `Budget.debate_extra_steps: int = 3`。
+- `agent.py`: `for` 循环改为 `while step < effective_max_steps`；`effective_max_steps` 在讨论触发时动态扩展；`debate_rounds_granted` 防止重复扩步。
+
+### 安全性
+- 候选池（Phase 2b.1）和多数投票（Phase 3a）保留，仍是兜底保障。
+- 讨论要求双方提供代码证据，相当于把"谁说了算"从"谁更权威（模型大小/角色）"变成"谁的代码更直接命中表格"。
+- **设计原则**：A/B/C 维度审查是**always-on 主检查**，独立重算是**额外一路证据**。
+  两模型答案一致 ≠ 没问题（可能共享盲点：都丢单位、都数行数而非去重），所以**即使重算
+  一致也照样跑 A/B/C**。
+- `verify(...)` 跑全部并合并：
+  ① `deterministic_issues`（无模型，命中即短路）
+  ② `llm_check` A/B/C 读表审查（**永远跑**）
+  ③ `compute_check` 独立重算（有 df 时跑）——verifier 用**另一模型**从零写 pandas 跑沙箱，
+     与主答案比对（`answers_match` 复用官方 evaluator）。`compute_match` = True 一致 /
+     False 不一致 / None 弃权。CoT 模型 `max_tokens=1500`。
+  任一路 flag → 整体 flag；`source` 形如 `llm` / `compute` / `llm+compute`。
+- **投票兜底（agent.py `_majority_vote`）**：finalize 时对 {主模型各次提交} + {**不一致的**重算}
+  做去噪聚类多数投票。关键：**只有"不一致"的重算才作为候选值入票**（提供真正的替代答案）；
+  "一致"的重算只算背书、不入票，以免和 A/B/C 纠正打架（否则共享盲点的重算 + 原答案会把
+  改对的答案投下去）。安全性质：**verifier 只有在某次主模型提交与它一致时才能改写答案**，
+  孤立错误重算赢不了平票，平票取**最近一次主模型提交**。
+- 实测：nt-647 重算出正确 16；nt-2354 verifier 重算乱码被投票挡掉；A/B/C 抓 `4x400 m`
+  漏 `relay`、`tied`/`tie`、`17,693`/`17693` 这类两模型共享的形式盲点。
+- 成本提醒：每次提交 2 次 verifier 调用（A/B/C + 重算），200 题整体耗时约 2-2.5x。
+
 ## `src/verifier.py` — Phase 2c table-aware + independent-model verify [2c]
 - **独立模型**：verifier 用 `load_verifier_config()` 选的模型，刻意≠solver（默认
   solver=qwen → verifier=deepseek-v4-flash），避免同模型同源盲点。`run_example` 收

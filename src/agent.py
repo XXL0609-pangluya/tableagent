@@ -31,7 +31,7 @@ from .schemas import (
     ToolCall,
     TraceEvent,
 )
-from .verifier import build_verify_feedback, verify
+from .verifier import build_debate_prompt, build_verify_feedback, verify
 from .tools.base import ToolRegistry, ToolSpec
 
 _PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prompts")
@@ -138,6 +138,41 @@ def _evidence_summary(state: AgentState) -> str:
     return " | ".join(parts)[:600] if parts else "(none)"
 
 
+def _majority_vote(solver_subs: list[list[str]], verifier_recos: list[list[str]]) -> list[str]:
+    """Choose the final answer by denotation-clustered majority over solver
+    submissions + verifier recomputations.
+
+    Safety property: the verifier can only change the answer when a SOLVER
+    submission agrees with it. A lone verifier recompute never wins a tie, so a
+    wrong checker (e.g. it recomputed 0) cannot drag a correct answer down. On a
+    tie we keep the LATEST solver submission (the deliberately re-derived one)."""
+    from .verifier import answers_match
+
+    votes = list(solver_subs) + list(verifier_recos)
+    clusters: list[dict] = []  # {rep, count, first_idx}
+    for idx, v in enumerate(votes):
+        for cl in clusters:
+            if answers_match(cl["rep"], v):
+                cl["count"] += 1
+                break
+        else:
+            clusters.append({"rep": v, "count": 1, "first_idx": idx})
+    if not clusters:
+        return []
+    top = max(c["count"] for c in clusters)
+    tied = [c for c in clusters if c["count"] == top]
+    if len(tied) == 1:
+        return tied[0]["rep"]
+    # tie -> prefer the cluster matching the latest solver submission, else first
+    last_solver = solver_subs[-1] if solver_subs else None
+    if last_solver is not None:
+        for c in tied:
+            if answers_match(c["rep"], last_solver):
+                return c["rep"]
+    tied.sort(key=lambda c: c["first_idx"])
+    return tied[0]["rep"]
+
+
 def _table_view(tc: TableContext, max_rows: int = 30, max_chars: int = 2500) -> str:
     """Compact table rendering for the verifier to inspect (schema + rows)."""
     lines = [tc.schema_text, "", "Rows:"]
@@ -178,15 +213,19 @@ def run_example(
     terminated = False
     verify_retries = 0
     last_verify: Optional[dict] = None
-    # Candidate pool: every submitted answer with whether it passed verification.
-    # Lets us fall back to the agent's first confident answer instead of letting a
-    # noisy advisory silently replace a good one (Phase 2b.1).
     candidates: list[tuple[list[str], bool]] = []
+    verifier_recomputes: list[list[str]] = []
+    # Phase 3b: mutable step ceiling — extended when a debate round is triggered.
+    # We track how many debate extensions have been granted so we don't keep
+    # expanding on every subsequent submit (one extension per verify retry).
+    effective_max_steps = budget.max_steps
+    debate_rounds_granted = 0
 
-    for step in range(budget.max_steps):
+    step = 0
+    while step < effective_max_steps:
         state.steps_used = step + 1
         # On the final allowed step, stop exploring and force a commitment.
-        if step == budget.max_steps - 1:
+        if step == effective_max_steps - 1:
             messages.append({
                 "role": "user",
                 "content": "This is your final step. Call submit_answer now with your best "
@@ -247,11 +286,17 @@ def run_example(
                 candidate = list(state.current_answer or [])
                 vr = verify(
                     verifier_client or client, example.utterance, candidate,
+                    df=table_context.df,
                     table_view=_table_view(table_context),
                     evidence_summary=_evidence_summary(state),
                 )
                 last_verify = vr.to_dict()
                 candidates.append((candidate, vr.ok))
+                # Only a DISAGREEING recompute becomes a vote (a genuine alternative
+                # value). A recompute that merely agrees must not outvote an
+                # A/B/C-driven correction where solver and verifier shared a blind spot.
+                if vr.compute_match is False and vr.recomputed:
+                    verifier_recomputes.append(list(vr.recomputed))
                 if tracer:
                     tracer.add(TraceEvent(
                         step=step, kind="verify",
@@ -264,9 +309,25 @@ def run_example(
                     state.current_answer = None
                     messages[-1]["content"] = (
                         (result.content_text or "")
-                        + "\n\n(Verification flagged a concern — see below. Re-check then resubmit.)"
+                        + "\n\n(Verification flagged a concern — see the debate prompt below.)"
                     )
-                    messages.append({"role": "user", "content": build_verify_feedback(vr)})
+                    # Phase 3b: use the full debate prompt (with verifier code evidence)
+                    # when compute evidence is available; simpler text-only prompt otherwise.
+                    if vr.verifier_code:
+                        feedback = build_debate_prompt(vr, candidate)
+                    else:
+                        feedback = build_verify_feedback(vr)
+                    messages.append({"role": "user", "content": feedback})
+                    # Grant extra steps for this debate round (once per retry).
+                    if debate_rounds_granted < verify_retries:
+                        effective_max_steps += budget.debate_extra_steps
+                        debate_rounds_granted += 1
+                        if tracer:
+                            tracer.add(TraceEvent(
+                                step=step, kind="debate_start",
+                                note=f"granted +{budget.debate_extra_steps} steps "
+                                     f"(effective_max={effective_max_steps})",
+                            ))
                 else:
                     terminated = True
                     if not vr.ok:
@@ -276,21 +337,28 @@ def run_example(
                         state.current_answer = None
             elif result.terminate:
                 terminated = True
+        step += 1
         if terminated:
             break
 
     # ---- Finalize (always produce something) ----
-    # Selection policy (Phase 2b.1): prefer the LAST candidate that passed
-    # verification; if none ever passed, fall back to the FIRST submitted
-    # candidate (the agent's initial confident answer) — this neutralises a
-    # noisy advisory that talked the agent out of a good answer.
+    # Selection policy:
+    #  - If compute-verifier produced disagreeing recomputes: MAJORITY VOTE over
+    #    {solver submissions} + {disagreeing recomputes}, tie-break to LATEST solver.
+    #  - Otherwise: prefer the EARLIEST candidate that passed verification —
+    #    the first confident answer is more likely to be correct than one produced
+    #    under pressure during a debate round (Phase 3b safety rule).
+    #  - Fallback chain: last_run_python → forced_final → last_text → empty.
     items: Optional[list[str]] = None
     source = "submit_answer"
     passed = [c for c, ok in candidates if ok]
-    if state.current_answer is not None:
-        items = state.current_answer  # last submit that terminated the loop
+    if verifier_recomputes and candidates:
+        items = _majority_vote([c for c, _ in candidates], verifier_recomputes)
+        source = "vote"
+    elif state.current_answer is not None:
+        items = state.current_answer  # last submit that terminated cleanly
     elif passed:
-        items, source = passed[-1], "verified_candidate"
+        items, source = passed[0], "first_verified"   # earliest verified answer
     elif candidates:
         items, source = candidates[0][0], "first_candidate"
 
