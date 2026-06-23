@@ -244,101 +244,96 @@ def llm_check(
 
 
 # --------------------------------------------------------------------------
-# Tier 2b — independent COMPUTE check (verifier writes & runs its own pandas)
+# Tier 2b — AUDIT check: reviews the generator's code history for specific flaws
+# (does NOT re-answer from scratch — only audits the generator's own reasoning)
 # --------------------------------------------------------------------------
 
-_COMPUTE_SYSTEM = """You are an INDEPENDENT verifier for table question answering,
-running on a different model than the solver. Solve the question YOURSELF from
-scratch — do NOT trust any prior answer. Write pandas code against the DataFrame
-`df` (every column is a string; cast with care, e.g. strip commas/units before
-int/float). Read the question precisely:
-- distinguish what is being counted (rows vs distinct values vs an entity buried
-  inside a cell like "Company (Country)"),
-- match the answer TYPE the question asks for (a name/label vs a number; one value
-  vs a list),
-- exclude Total/summary rows and handle blank or "–"/"—" cells when aggregating.
+_AUDIT_SYSTEM = """You are a meticulous code auditor reviewing a student's work on a table question-answering task.
 
-Your code MUST assign the final answer to a variable `answer` (a scalar, or a list
-for multi-item answers). Return ONLY one python code block, nothing else."""
+IMPORTANT: You are NOT re-answering the question. You are AUDITING the student's reasoning process.
+
+You will receive:
+1. The question
+2. A sample of the table
+3. The student's proposed answer
+4. The student's run_python steps (code + outputs)
+
+Your job: find ONE specific, concrete flaw in the student's code or reasoning, if any. 
+
+VALID flaws to flag (all pointing to a specific step):
+- Wrong aggregation: "Step 2 used .count() but the question needs .nunique() for distinct values"
+- Missing exclusion: "Step 3 didn't filter out the Total/summary row (e.g. row where Name='Total')"
+- Wrong column: "Step 1 filtered by column 'Winner' but the question asks about 'Runner-up'"
+- Off-by-one: "Step 2's date filter is >= instead of >, including the boundary date itself"
+- Truncated cell: "The answer '4x400 m' is a substring of cell '4x400 m relay' — use the full cell"
+- Type mismatch: "The answer is a number but the question asks for a name/label"
+
+INVALID — do NOT do these:
+- Do NOT compute the answer yourself from scratch
+- Do NOT say "the answer should be X" without pointing to a specific flawed step
+- Do NOT invent flaws; if the student's work looks sound, say it passes
+- Do NOT flag stylistic issues — only flag logical/factual errors
+
+Respond with JSON only:
+{
+  "flawed": true|false,
+  "step": "which step is flawed, e.g. 'run_python step 2' or 'final answer format'",
+  "flaw": "one sentence describing the concrete error",
+  "test": "one line of pandas code the student can run to verify this claim (or empty string)"
+}"""
 
 
-def _df_view(df: pd.DataFrame, max_rows: int = 8, max_chars: int = 2000) -> str:
-    cols = ", ".join(f"{c!r}" for c in df.columns)
-    lines = [f"Columns ({len(df.columns)}): {cols}", f"Row count: {len(df)}", "", "Sample rows:"]
-    for i in range(min(max_rows, len(df))):
-        cells = " | ".join(f"{c}={str(df.iloc[i][c])}" for c in df.columns)
-        lines.append(f"  [{i}] {cells}")
-    text = "\n".join(lines)
-    return text if len(text) <= max_chars else text[:max_chars] + "\n…(truncated)"
-
-
-def _extract_code(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"```(?:python)?\s*(.+?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip()
-    # no fence — assume the whole thing is code if it looks like it
-    return text.strip() if ("answer" in text and "=" in text) else ""
-
-
-def compute_check(
+def audit_check(
     client: LLMClient,
     question: str,
     items: list[str],
-    df: pd.DataFrame,
+    code_history: str,
+    table_view: str = "",
     *,
-    max_tokens: int = 1500,
-    timeout_s: float = 10.0,
+    max_tokens: int = 1024,
 ) -> VerifyResult:
-    """Verifier independently recomputes the answer and compares to the solver's.
+    """Audit the generator's own code history for a specific logical flaw.
 
-    - match  -> ok=True  (corroborated by a second model + second computation)
-    - differ -> ok=False (flag, carry the recomputed value as an advisory hint)
-    - verifier failed/abstained -> ok=True, source 'none' (no signal)
+    Returns the flaw description + a one-liner test the generator can run to
+    verify the claim. Does NOT compute a new answer.
     """
     user = (
         f"Question: {question}\n\n"
-        f"{_df_view(df)}\n\n"
-        "Write pandas code that sets `answer`."
+        f"Student's proposed answer: {items}\n\n"
+        f"Table sample:\n{table_view or '(not provided)'}\n\n"
+        f"Student's reasoning steps:\n{code_history or '(no code steps recorded)'}\n"
     )
     try:
         resp = client.chat(
-            messages=[{"role": "system", "content": _COMPUTE_SYSTEM}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": _AUDIT_SYSTEM},
+                      {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.0,
         )
-    except Exception as exc:  # noqa: BLE001 — never block the run
-        return VerifyResult(ok=True, source="none", model=client.config.model, raw=f"compute skipped: {exc}")
-
-    code = _extract_code(resp.text or "")
-    if not code:
-        return VerifyResult(ok=True, source="none", model=client.config.model, raw="no code emitted")
-
-    exec_res = run_code(code, df.copy(), timeout_s=timeout_s)
-    if not exec_res.ok or exec_res.answer is None:
+    except Exception as exc:  # noqa: BLE001
         return VerifyResult(ok=True, source="none", model=client.config.model,
-                            raw=f"compute error: {exec_res.error or 'answer not set'}")
+                            raw=f"audit skipped: {exc}")
 
-    from .tools.wtq_tools import coerce_items  # local import to avoid cycle
-    v_items = coerce_items(exec_res.answer)
-    if not v_items:
-        return VerifyResult(ok=True, source="none", model=client.config.model, raw="empty recompute")
+    raw = resp.text or ""
+    parsed = _parse_json(raw)
+    flawed = bool(parsed.get("flawed", False))
+    if not flawed:
+        return VerifyResult(ok=True, source="audit", model=client.config.model, raw=raw[:300])
 
-    if answers_match(items, v_items):
-        return VerifyResult(ok=True, source="compute", model=client.config.model,
-                            recomputed=v_items, compute_match=True,
-                            verifier_code=code, verifier_stdout=exec_res.stdout[:400])
+    step_desc = str(parsed.get("step") or "").strip()
+    flaw_desc = str(parsed.get("flaw") or "").strip()
+    test_code = str(parsed.get("test") or "").strip()
+    if not flaw_desc:
+        return VerifyResult(ok=True, source="none", model=client.config.model, raw=raw[:300])
 
-    issue = (
-        f"An independent recomputation (different model) produced {v_items}, "
-        f"which differs from your answer {items}."
+    issue = f"[{step_desc}] {flaw_desc}" if step_desc else flaw_desc
+    return VerifyResult(
+        ok=False, issues=[issue], source="audit",
+        model=client.config.model,
+        verifier_code=test_code,   # reuse field: the test-code to reproduce the claim
+        fix_hint=f"Run: {test_code}" if test_code else "",
+        raw=raw[:300],
     )
-    return VerifyResult(ok=False, issues=[issue], source="compute", model=client.config.model,
-                        recomputed=v_items, compute_match=False,
-                        verifier_code=code, verifier_stdout=exec_res.stdout[:400],
-                        fix_hint="Re-read the question and re-derive with run_python; "
-                        "decide which interpretation matches the question.")
 
 
 # --------------------------------------------------------------------------
@@ -353,22 +348,19 @@ def verify(
     df: Optional[pd.DataFrame] = None,
     table_view: str = "",
     evidence_summary: str = "",
+    code_history: str = "",
     use_llm: bool = True,
 ) -> VerifyResult:
-    """Run ALL applicable checks and aggregate. Crucially, the A/B/C dimensional
-    review ALWAYS runs even when the independent recompute agrees — two models
-    can share the same blind spot (e.g. both drop a unit, both count rows instead
-    of distinct values), so answer-agreement alone is not sufficient.
-
-      1. deterministic rules (no model) — short-circuits if it fires (high precision)
-      2. A/B/C dimensional review (reads table) — ALWAYS runs
-      3. independent COMPUTE check (verifier runs its own pandas) — if df given
-    A concern from ANY tier flags the answer. The recompute's value is also carried
-    as an extra vote for finalize, whether or not it agreed.
+    """Three tiers, all running independently:
+      1. deterministic rules (no model) — short-circuits on high-precision hits
+      2. A/B/C dimensional review — checks answer quality (form, intent, counting)
+      3. AUDIT of the generator's code history — finds specific logical flaws
+         (does NOT re-answer; points to a concrete step and provides a test snippet)
     """
     if not items:
         return VerifyResult(ok=True, source="none")
 
+    # Tier 1: deterministic (no model cost)
     det = deterministic_issues(question, items)
     if df is not None:
         det += cell_substring_issues(items, df)
@@ -381,10 +373,10 @@ def verify(
     # Tier 2: A/B/C dimensional review (always on)
     review = llm_check(client, question, items, table_view, evidence_summary)
 
-    # Tier 3: independent recompute (extra evidence)
-    compute = (
-        compute_check(client, question, items, df)
-        if df is not None else VerifyResult(ok=True, source="none")
+    # Tier 3: audit the generator's code history for specific logical flaws
+    audit = (
+        audit_check(client, question, items, code_history, table_view)
+        if code_history else VerifyResult(ok=True, source="none")
     )
 
     issues: list[str] = []
@@ -396,20 +388,20 @@ def verify(
         issues += review.issues
         axis = review.axis or axis
         sources.append("llm")
-    if compute.source == "compute" and not compute.ok:
+    if not audit.ok:
         ok = False
-        issues += compute.issues
-        sources.append("compute")
+        issues += audit.issues
+        sources.append("audit")
 
+    final_source = "+".join(sources) if sources else "none"
     return VerifyResult(
         ok=ok,
         issues=issues,
-        fix_hint=compute.fix_hint or review.fix_hint,
-        source="+".join(sources) if sources else ("compute" if compute.recomputed else "none"),
+        fix_hint=audit.fix_hint or review.fix_hint,
+        source=final_source,
         axis=axis,
         model=client.config.model,
-        recomputed=compute.recomputed,
-        compute_match=compute.compute_match,
+        verifier_code=audit.verifier_code,   # the test snippet from the audit
     )
 
 
@@ -422,49 +414,45 @@ _AXIS_HINT = {
 
 
 def build_debate_prompt(vr: VerifyResult, solver_answer: list[str]) -> str:
-    """Structured debate-mode prompt injected after a verification flag.
-
-    Shows the verifier's code evidence (if available) so the generator can
-    evaluate it critically instead of just capitulating on a text assertion.
-    The generator MUST run its own run_python before resubmitting — that code
-    is the evidence that decides who is right.
-    """
+    """Debate-mode prompt: auditor presents a specific claim; generator evaluates it
+    critically with code, then decides. The generator's default stance is confidence
+    in its own derivation — only change if the specific claim is verified."""
     lines = [
-        "═══ VERIFIER REPORT ═══",
-        f"An independent verifier (different model: {vr.model}) reviewed your answer "
-        f"{solver_answer} and raised concerns.",
+        "═══ AUDITOR REPORT ═══",
+        f"An independent auditor (model: {vr.model}) reviewed your reasoning steps "
+        f"and raised a specific concern about your answer {solver_answer}.",
         "",
     ]
 
-    # Show the verifier's actual code so the generator can judge it
+    # Show the specific audit finding
+    if vr.issues:
+        lines.append("Specific claim: " + "; ".join(vr.issues))
+    if vr.axis and vr.axis in _AXIS_HINT:
+        lines.append(f"Category: Axis {vr.axis} — {_AXIS_HINT[vr.axis]}")
+
+    # Show the test code if available
     if vr.verifier_code:
         lines += [
-            f"The verifier ran this pandas code and got {vr.recomputed}:",
+            "",
+            "The auditor suggests running this targeted test to verify the claim:",
             "```python",
             vr.verifier_code.strip(),
             "```",
         ]
-        if vr.verifier_stdout:
-            lines += [f"stdout: {vr.verifier_stdout.strip()}"]
-        lines.append("")
-
-    # A/B/C axis finding
-    if vr.axis and vr.axis in _AXIS_HINT:
-        lines.append(f"Axis {vr.axis} concern — {_AXIS_HINT[vr.axis]}")
-    if vr.issues:
-        lines.append("Specific concern: " + "; ".join(vr.issues))
-    if vr.fix_hint:
-        lines.append(f"Verifier suggests re-checking: {vr.fix_hint}")
 
     lines += [
         "",
-        "═══ YOUR TURN ═══",
-        "You have been granted extra steps for this discussion.",
-        "You MUST run run_python to verify before resubmitting. Two paths:",
-        "  • Defend your answer: run code that proves YOUR derivation is correct, then resubmit the SAME answer.",
-        "  • Accept the correction: run code that confirms the verifier's logic is right, then resubmit the corrected answer.",
-        "Do NOT change your answer without running code. If you run code and both answers look plausible,",
-        "trust the one whose derivation is more directly supported by the table.",
+        "═══ YOUR TURN (you have extra steps) ═══",
+        "You are the expert who worked directly with this table.",
+        "Default stance: your answer is PRESUMED CORRECT.",
+        "",
+        "Run the test above (or equivalent code) and then decide:",
+        "  • If the test CONFIRMS the auditor's claim → fix the specific issue and resubmit.",
+        "  • If the test REFUTES the claim → resubmit your ORIGINAL answer with",
+        "    the test output as evidence. A single assertion without proof is not enough",
+        "    to change your answer.",
+        "",
+        "Do not change your answer based on the auditor's words alone — only on code evidence.",
     ]
     return "\n".join(lines)
 

@@ -138,41 +138,6 @@ def _evidence_summary(state: AgentState) -> str:
     return " | ".join(parts)[:600] if parts else "(none)"
 
 
-def _majority_vote(solver_subs: list[list[str]], verifier_recos: list[list[str]]) -> list[str]:
-    """Choose the final answer by denotation-clustered majority over solver
-    submissions + verifier recomputations.
-
-    Safety property: the verifier can only change the answer when a SOLVER
-    submission agrees with it. A lone verifier recompute never wins a tie, so a
-    wrong checker (e.g. it recomputed 0) cannot drag a correct answer down. On a
-    tie we keep the LATEST solver submission (the deliberately re-derived one)."""
-    from .verifier import answers_match
-
-    votes = list(solver_subs) + list(verifier_recos)
-    clusters: list[dict] = []  # {rep, count, first_idx}
-    for idx, v in enumerate(votes):
-        for cl in clusters:
-            if answers_match(cl["rep"], v):
-                cl["count"] += 1
-                break
-        else:
-            clusters.append({"rep": v, "count": 1, "first_idx": idx})
-    if not clusters:
-        return []
-    top = max(c["count"] for c in clusters)
-    tied = [c for c in clusters if c["count"] == top]
-    if len(tied) == 1:
-        return tied[0]["rep"]
-    # tie -> prefer the cluster matching the latest solver submission, else first
-    last_solver = solver_subs[-1] if solver_subs else None
-    if last_solver is not None:
-        for c in tied:
-            if answers_match(c["rep"], last_solver):
-                return c["rep"]
-    tied.sort(key=lambda c: c["first_idx"])
-    return tied[0]["rep"]
-
-
 def _table_view(tc: TableContext, max_rows: int = 30, max_chars: int = 2500) -> str:
     """Compact table rendering for the verifier to inspect (schema + rows)."""
     lines = [tc.schema_text, "", "Rows:"]
@@ -214,10 +179,9 @@ def run_example(
     verify_retries = 0
     last_verify: Optional[dict] = None
     candidates: list[tuple[list[str], bool]] = []
-    verifier_recomputes: list[list[str]] = []
-    # Phase 3b: mutable step ceiling — extended when a debate round is triggered.
-    # We track how many debate extensions have been granted so we don't keep
-    # expanding on every subsequent submit (one extension per verify retry).
+    # Code history for the auditor: list of (code, output) strings from run_python calls.
+    code_history_parts: list[str] = []
+    # Phase 3b: mutable step ceiling
     effective_max_steps = budget.max_steps
     debate_rounds_granted = 0
 
@@ -267,9 +231,16 @@ def run_example(
             result = execute_tool(registry, name, args, state)
 
             if name == "run_python" and result.ok:
-                items = result.structured.get("answer_items")
-                if items:
-                    last_run_items = items
+                items_rp = result.structured.get("answer_items")
+                if items_rp:
+                    last_run_items = items_rp
+                # Record for auditor: code + truncated output
+                code_snippet = args.get("code", "")[:600]
+                output_snippet = (result.content_text or "")[:300]
+                step_label = f"=== run_python step {len(code_history_parts) + 1} ==="
+                code_history_parts.append(
+                    f"{step_label}\n{code_snippet}\n--- output ---\n{output_snippet}"
+                )
 
             messages.append({
                 "role": "tool",
@@ -284,23 +255,20 @@ def run_example(
                 ))
             if result.terminate and name == "submit_answer" and result.ok:
                 candidate = list(state.current_answer or [])
+                code_history = "\n\n".join(code_history_parts)
                 vr = verify(
                     verifier_client or client, example.utterance, candidate,
                     df=table_context.df,
                     table_view=_table_view(table_context),
                     evidence_summary=_evidence_summary(state),
+                    code_history=code_history,
                 )
                 last_verify = vr.to_dict()
                 candidates.append((candidate, vr.ok))
-                # Only a DISAGREEING recompute becomes a vote (a genuine alternative
-                # value). A recompute that merely agrees must not outvote an
-                # A/B/C-driven correction where solver and verifier shared a blind spot.
-                if vr.compute_match is False and vr.recomputed:
-                    verifier_recomputes.append(list(vr.recomputed))
                 if tracer:
                     tracer.add(TraceEvent(
                         step=step, kind="verify",
-                        note=f"ok={vr.ok} src={vr.source} issues={vr.issues[:3]} hint={vr.fix_hint[:120]}",
+                        note=f"ok={vr.ok} src={vr.source} issues={vr.issues[:2]}",
                     ))
                 if not vr.ok and verify_retries < budget.max_verify_retries:
                     verify_retries += 1
@@ -341,24 +309,17 @@ def run_example(
         if terminated:
             break
 
-    # ---- Finalize (always produce something) ----
-    # Selection policy:
-    #  - If compute-verifier produced disagreeing recomputes: MAJORITY VOTE over
-    #    {solver submissions} + {disagreeing recomputes}, tie-break to LATEST solver.
-    #  - Otherwise: prefer the EARLIEST candidate that passed verification —
-    #    the first confident answer is more likely to be correct than one produced
-    #    under pressure during a debate round (Phase 3b safety rule).
-    #  - Fallback chain: last_run_python → forced_final → last_text → empty.
+    # ---- Finalize ----
+    # Prefer the EARLIEST verified candidate: the first confident answer is
+    # more trustworthy than one produced under debate-round pressure.
+    # Fallback chain: last clean submit → first verified → first candidate → run_python → forced.
     items: Optional[list[str]] = None
     source = "submit_answer"
     passed = [c for c, ok in candidates if ok]
-    if verifier_recomputes and candidates:
-        items = _majority_vote([c for c, _ in candidates], verifier_recomputes)
-        source = "vote"
-    elif state.current_answer is not None:
-        items = state.current_answer  # last submit that terminated cleanly
+    if state.current_answer is not None:
+        items = state.current_answer
     elif passed:
-        items, source = passed[0], "first_verified"   # earliest verified answer
+        items, source = passed[0], "first_verified"
     elif candidates:
         items, source = candidates[0][0], "first_candidate"
 
