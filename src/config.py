@@ -25,6 +25,16 @@ class LLMConfig:
     temperature: float = 0.0
     max_tokens: int = 1024
     timeout_s: float = 60.0
+    # Minimum seconds between requests to the endpoint (client-side pacing to avoid
+    # 429 rate-limit storms on long batch runs). 0 = no pacing. Set via LLM_MIN_INTERVAL_S.
+    min_interval_s: float = 0.0
+
+
+def _min_interval() -> float:
+    try:
+        return float(os.environ.get("LLM_MIN_INTERVAL_S", "0") or "0")
+    except ValueError:
+        return 0.0
 
 
 def load_llm_config(
@@ -42,6 +52,7 @@ def load_llm_config(
         api_key=api_key,
         model=model or os.environ.get("LLM_MODEL", "deepseek-v4-flash"),
         temperature=0.0 if temperature is None else temperature,
+        min_interval_s=_min_interval(),
     )
 
 
@@ -63,4 +74,5 @@ def load_verifier_config(model: Optional[str] = None) -> LLMConfig:
     )
     if not base_url or not api_key:
         raise RuntimeError("VERIFIER/LLM base_url or api_key missing in .env")
-    return LLMConfig(base_url=base_url, api_key=api_key, model=verifier_model, temperature=0.0)
+    return LLMConfig(base_url=base_url, api_key=api_key, model=verifier_model,
+                     temperature=0.0, min_interval_s=_min_interval())

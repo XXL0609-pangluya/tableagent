@@ -33,7 +33,15 @@ answer = df.loc[pos - 1, 'Player']           # previous / before  (pos + 1 for n
 - "the next heaviest/fastest/... after X": sort by that numeric column, find X's
   position in the sorted order, take the neighbour.
 
+## "name another X (other than Y)" → return exactly ONE
+"name another region other than Greece", "a different team than X" want a SINGLE
+other item (usually the first one that isn't the excluded Y), not the whole list.
+Return one item; do not dump every remaining row.
+
 ## Mistakes to avoid
-- Returning the `Total`/summary row as the "last" entry.
+- Returning the `Total`/summary row as the "last" entry (or as first/most/least).
+  A summary label like `Total`/`Average` is NEVER a valid entity answer — drop those
+  rows first, then take the position.
 - Sorting when the question means listed order (or vice versa).
 - Off-by-one: confirm which direction "before/after" means for this table.
+- "name another X" → returning several items instead of one.

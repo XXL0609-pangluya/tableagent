@@ -89,6 +89,16 @@ def _expects_single(question: str) -> Optional[bool]:
         return True
     if re.search(r"\b(list|name all|which ones|what are all)\b", q):
         return False
+    # Explicit-plural / list questions → expect a LIST, not a single item.
+    if "(s)" in q or "for each" in q or \
+       re.search(r"\b(two|three|four|five|six|seven|eight|nine|ten|both)\b", q):
+        return False
+    # "which buildings/nations/players/routes ..." (plural head noun) → a list.
+    m = re.match(r"^(which|what)\s+([a-z]+)", q)
+    if m:
+        noun = m.group(2)
+        if noun.endswith("s") and noun not in ("is", "was", "series", "does", "has"):
+            return False
     if re.match(r"^(which|who|what|where|when)\b", q) and " and " not in q:
         return True
     return None
@@ -100,8 +110,15 @@ def _expects_exactly_one(question: str) -> bool:
     q = question.strip().lower()
     if re.search(r"\b(list|name all|which ones|what are all|all of|which.*\bare\b)\b", q):
         return False
+    # Explicit plural markers → NOT exactly one: "which season(s)", "what TWO teams",
+    # "both", "three monarchs". (Measured: these were the cardinality check's only FPs.)
+    if "(s)" in q or re.search(r"\b(two|three|four|five|six|seven|eight|nine|ten|both)\b", q):
+        return False
     # explicit singular markers
     if re.search(r"\bthe (only|first|last|single|sole)\b", q):
+        return True
+    # "name another X", "a different X", "one other X" → exactly one more
+    if re.search(r"\b(another|a different|one other)\b", q):
         return True
     if re.search(r"\b(who|whom|whose)\b", q):
         return True
@@ -119,6 +136,25 @@ _NUMERIC_NOUNS = (
     "year", "number", "percentage", "percent", "amount", "count", "total",
     "time", "score", "rank", "place", "position", "age", "size", "distance",
     "difference", "average", "sum", "many", "much",
+)
+
+# Superlative / argmax markers: "which X had the MOST points" wants the entity X,
+# almost never the measure (points) or a numeric id.
+_SUPERLATIVE_RE = re.compile(
+    r"\b(most|least|fewest|highest|lowest|largest|smallest|greatest|biggest|"
+    r"longest|shortest|best|worst|top|maximum|minimum|earliest|latest)\b"
+)
+
+# Verbs/auxiliaries that can follow "which/what" without being the entity noun.
+_COPULAS = (
+    "is", "was", "are", "were", "did", "does", "do", "has", "have", "had",
+    "will", "would", "the", "a", "an", "went", "finished", "came", "ranked",
+)
+# Possession/action verbs implying an ENTITY subject: "which [team] HAD the most".
+# With a superlative, the answer is that entity's name (not the measure/id).
+_POSSESSIVE_VERBS = (
+    "had", "have", "has", "got", "scored", "won", "made", "played", "recorded",
+    "went", "finished", "came", "ranked", "earned", "gained", "achieved",
 )
 
 
@@ -139,8 +175,12 @@ def _expects_label(question: str) -> Optional[bool]:
         if noun in _NUMERIC_NOUNS:
             return False
         # skip copulas/auxiliaries/determiners — those aren't the entity noun
-        if noun in ("is", "was", "are", "were", "did", "does", "do", "has",
-                    "have", "had", "will", "would", "the", "a", "an"):
+        if noun in _COPULAS:
+            # "which had the MOST/LEAST ..." → argmax over an entity: wants a name.
+            # (e.g. "compare draws, which had the least points?" → the Artist, not '5')
+            # Restrict to possession verbs: "which WAS the highest" may want the value.
+            if noun in _POSSESSIVE_VERBS and _SUPERLATIVE_RE.search(q):
+                return True
             return None
         return True  # "which monarch / what team ..." → wants an entity label
     return None
@@ -173,6 +213,30 @@ def _is_number(s: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+# Labels of summary/aggregation rows that are almost never a valid entity answer.
+_SUMMARY_ANSWER_LABELS = {
+    "total", "totals", "total:", "grand total", "sum", "subtotal", "average",
+    "averages", "avg", "mean", "overall", "all", "n/a", "—", "-",
+}
+
+
+def summary_label_issues(question: str, items: list[str]) -> list[str]:
+    """B/C-axis (high precision): the answer is a summary-row LABEL like 'Total'.
+    These rows are aggregations, not real entities — returning one as e.g. the
+    'last discipline' / 'which team' answer is almost always a mistake (often the
+    result of not excluding the Total row before taking first/last/argmax)."""
+    if len(items) != 1:
+        return []
+    ans = items[0].strip().lower()
+    if ans in _SUMMARY_ANSWER_LABELS:
+        return [
+            f"The answer '{items[0]}' is a SUMMARY/total-row label, not a real data "
+            "entity. Exclude summary rows (Total/Average/...) before taking the "
+            "first/last/most/least, then return the actual data row."
+        ]
+    return []
 
 
 def cell_substring_issues(items: list[str], df: "pd.DataFrame") -> list[str]:
@@ -289,8 +353,11 @@ def deterministic_issues(question: str, items: list[str]) -> list[str]:
             f"The question seems to expect a single answer but {len(items)} items were returned: {items}. "
             "Re-check whether the filter is too broad."
         )
-    # B-axis: wants a name/label but got a bare number.
-    issues += answer_type_issues(question, items)
+    # NOTE: answer_type_issues ('wants a name but got a number') measured 0/6 on the
+    # 1000-set — many 'what car / which ranking / which works number / 8 or 21' answers
+    # are legitimately numbers — so it is intentionally NOT wired in (net-harmful).
+    # B/C-axis: the answer is a summary-row label (Total/Average/...).
+    issues += summary_label_issues(question, items)
     return issues
 
 
@@ -598,12 +665,13 @@ def verify(
     if not items:
         return VerifyResult(ok=True, source="none")
 
-    # Tier 1: deterministic (no model cost) — only on round 1
+    # Tier 1: deterministic (no model cost) — only on round 1.
+    # NOTE: cell_substring_issues / format_drift_issues were measured on a 1000-example
+    # set to have LOW precision (substr 6/26, drift 0/1) — they mostly fire on CORRECT
+    # answers (multi-line cells, 'India (IND)', month names) and fixed nothing, so they
+    # are intentionally NOT wired in. WTQ's multi-line gold is too inconsistent to snap.
     if debate_round <= 1:
         det = deterministic_issues(question, items)
-        if df is not None:
-            det += cell_substring_issues(items, df)
-            det += format_drift_issues(items, df)
         if det:
             return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
 

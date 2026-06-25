@@ -104,15 +104,18 @@ def main() -> int:
         if ex.id in done_ids:
             continue
         ex_t0 = time.time()
+        tracer = None
         try:
             tc = data.load_table(ex.table_path)
             tracer = Tracer(trace_path, ex.id)
             pred = run_example(ex, tc, registry, client, prompts, budget=budget, tracer=tracer,
                                verifier_client=verifier_client)
-            tracer.flush(extra={"question": ex.utterance, "gold": ex.target_value, "pred": pred.items})
         except Exception as exc:  # keep a long run alive on a single bad example
             from src.schemas import Prediction
             pred = Prediction(id=ex.id, items=[], evidence={"error": f"{type(exc).__name__}: {exc}"})
+        # Trace logging is isolated: a flush failure must NEVER discard a good answer.
+        if tracer is not None:
+            tracer.flush(extra={"question": ex.utterance, "gold": ex.target_value, "pred": pred.items})
         predictions[ex.id] = pred.items
         rows.append({"id": ex.id, "q": ex.utterance, "pred": pred.items,
                      "gold": ex.target_value, "src": pred.evidence.get("answer_source"),
@@ -120,7 +123,8 @@ def main() -> int:
                      "verify": pred.evidence.get("verify"),
                      "verify_retries": pred.evidence.get("verify_retries"),
                      "candidates": pred.evidence.get("candidates"),
-                     "skills": pred.evidence.get("skills")})
+                     "skills": pred.evidence.get("skills"),
+                     "error": pred.evidence.get("error")})
         _save_checkpoint(ckpt_path, rows, t0)
 
         vnote = " verify=FAIL" if (pred.evidence.get("verify") and not pred.evidence["verify"].get("ok")) else ""

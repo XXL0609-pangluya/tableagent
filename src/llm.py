@@ -7,6 +7,7 @@ Phase 1; this module deliberately stays provider-agnostic and dependency-light.
 from __future__ import annotations
 
 import json
+import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -15,6 +16,22 @@ from openai import OpenAI
 
 from .config import LLMConfig, load_llm_config
 from .schemas import ToolCall
+
+
+# Module-level pacing shared across ALL clients (solver + verifier hit the same
+# endpoint, so spacing must be global). Single-threaded runner → no lock needed.
+_last_request_ts: float = 0.0
+
+
+def _pace(min_interval_s: float) -> None:
+    global _last_request_ts
+    if min_interval_s <= 0:
+        return
+    now = time.time()
+    wait = _last_request_ts + min_interval_s - now
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_ts = time.time()
 
 
 @dataclass
@@ -83,20 +100,30 @@ class LLMClient:
             raw=resp,
         )
 
-    def _create_with_retry(self, kwargs: dict[str, Any], attempts: int = 3, backoff_s: float = 1.5):
+    def _create_with_retry(self, kwargs: dict[str, Any], attempts: int = 6, backoff_s: float = 2.0):
         """Call the endpoint with retries on transient errors (timeouts / 5xx / rate limits).
 
         A single dropped request used to surface as an empty prediction in a long
-        batch run, so we retry a few times before giving up.
+        batch run. The company endpoint throttles bursts as `500 - 上游服务错误[429]`,
+        so we use exponential backoff with jitter and wait MUCH longer when the error
+        looks like rate limiting (429), since the whole server is shedding load.
         """
         last_exc: Optional[Exception] = None
         for i in range(attempts):
             try:
+                _pace(self.config.min_interval_s)
                 return self._client.chat.completions.create(**kwargs)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                if i < attempts - 1:
-                    time.sleep(backoff_s * (i + 1))
+                if i >= attempts - 1:
+                    break
+                msg = str(exc)
+                rate_limited = "429" in msg or "rate" in msg.lower() or \
+                    type(exc).__name__ == "RateLimitError"
+                # exponential backoff (2,4,8,16,32...) with longer base for 429
+                base = backoff_s * (4.0 if rate_limited else 1.0)
+                delay = min(base * (2 ** i), 60.0) + random.uniform(0, 1.5)
+                time.sleep(delay)
         raise last_exc  # type: ignore[misc]
 
     def probe_native_tools(self) -> tuple[bool, str]:

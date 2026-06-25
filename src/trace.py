@@ -19,10 +19,21 @@ def _to_jsonable(obj: Any) -> Any:
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return {k: _to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
     if isinstance(obj, dict):
-        return {k: _to_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+        return {_to_jsonable(k) if not isinstance(k, str) else k: _to_jsonable(v)
+                for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
         return [_to_jsonable(v) for v in obj]
-    return obj
+    if isinstance(obj, (str, bool, int, float)) or obj is None:
+        return obj
+    # numpy / pandas scalars and other exotic leaves: coerce to a JSON-safe form
+    # so a stray numpy.int64 in run_python output can never crash trace logging.
+    item = getattr(obj, "item", None)
+    if callable(item):
+        try:
+            return _to_jsonable(item())
+        except Exception:  # noqa: BLE001
+            pass
+    return str(obj)
 
 
 class Tracer:
@@ -40,6 +51,9 @@ class Tracer:
         self.events.append(event)
 
     def flush(self, extra: Optional[dict] = None) -> None:
+        """Append one JSON record. Never raises into the caller: trace logging must
+        not be able to discard a successful prediction (it once did — a stray numpy
+        scalar made json.dumps throw and the run loop treated it as a failed example)."""
         record = {
             "trace_id": self.trace_id,
             "example_id": self.example_id,
@@ -48,5 +62,16 @@ class Tracer:
         }
         if extra:
             record["meta"] = _to_jsonable(extra)
-        with open(self.out_path, "a", encoding="utf8") as fout:
-            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            line = json.dumps(record, ensure_ascii=False)
+        except Exception as exc:  # noqa: BLE001 — last-resort minimal record
+            line = json.dumps({
+                "trace_id": self.trace_id,
+                "example_id": self.example_id,
+                "trace_error": f"{type(exc).__name__}: {exc}",
+            }, ensure_ascii=False, default=str)
+        try:
+            with open(self.out_path, "a", encoding="utf8") as fout:
+                fout.write(line + "\n")
+        except Exception:  # noqa: BLE001 — disk/logging issues never fail a run
+            pass

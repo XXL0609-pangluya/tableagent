@@ -5,6 +5,9 @@
     "nt-9465": "Q asks 'how does brazil RANK in average receipts per visitor' but gold=1,147 is the receipts-per-visitor VALUE, not a rank.",
     "nt-11748": "Q asks 'what is the highest PERCENTAGE of speakers other than polish' (a number) but gold='Yiddish' is the language NAME, not a percentage. Question/answer type are inconsistent.",
     "nt-9828": "Q asks 'average number of affiliates' — the true mean is 1.14, but gold='1'. Gold appears to floor/round inconsistently; 1.14 is the defensible average.",
-    "nt-8912": "Q asks 'which region has more than one format' but gold='United States' only; United States, The Netherlands AND Worldwide each appear with >1 distinct Format, so the gold is under-specified."
+    "nt-8912": "Q asks 'which region has more than one format' but gold='United States' only; United States, The Netherlands AND Worldwide each appear with >1 distinct Format, so the gold is under-specified.",
+    "nt-6926": "Q 'how many times was War Memorial Stadium the game site' — the Game site column contains EXACTLY 7 rows equal to 'War Memorial Stadium' (weeks 2,4,6,7,8,9,13), but gold='6'. The table contradicts the gold; 7 is the verifiable count.",
+    "nt-1642": "Q 'name the only american who did not finish the race' requires NATIONALITY, but the table has no nationality column (cols: Class/No/Team/Drivers/Chassis/Engine/Laps). The answer (Masten Gregory is American) is not derivable from the table — needs external world knowledge.",
+    "nt-517": "Q 'does Lafayette or Benton HS have green and grey as their colors' requires SCHOOL COLORS, but the table has no colors column (cols: School/Team Name/Town/County/Enrollment/class). Not derivable from the table — needs external world knowledge."
   }
 }

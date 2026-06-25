@@ -12,6 +12,7 @@ Tools never raise; failures are encoded in ToolResult.
 from __future__ import annotations
 
 import difflib
+import re
 from typing import Any
 
 import pandas as pd
@@ -20,6 +21,182 @@ from ..context_budget import truncate_text
 from ..sandbox import run_code
 from ..schemas import AgentState, ToolResult
 from .base import Tool, ToolSpec
+
+_SUMMARY_LABELS = {"total", "totals", "sum", "all", "overall", "average",
+                   "averages", "subtotal", "grand total", "合计", "总计"}
+_PLACEHOLDERS = {"", "-", "–", "—", "n/a", "na", "?", "tbd", "—", "null", "none"}
+# leading number, allowing unicode minus (−, U+2212) and thousands separators
+_NUM_RE = re.compile(r"^\s*[-−–]?\s*[\d][\d,. ]*")
+
+
+_MONTHS_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.I)
+
+
+def _looks_numeric_dirty(values: list[str]) -> bool:
+    """A column that is mostly numbers but wrapped in junk (units, parens, %, unicode
+    minus) — needs cleaning before arithmetic. Returns True if worth warning about.
+
+    Excludes date-like columns (most cells contain a month name): those are dates, not
+    dirty numerics, and a 'extract the number' hint would mislead."""
+    nonblank = [v for v in values if v.strip() and v.strip().lower() not in _PLACEHOLDERS]
+    if len(nonblank) < 3:
+        return False
+    if sum(1 for v in nonblank if _MONTHS_RE.search(v)) >= 0.5 * len(nonblank):
+        return False  # date column
+    has_num = sum(1 for v in nonblank if _NUM_RE.match(v))
+    if has_num < 0.6 * len(nonblank):
+        return False
+    # "dirty" if a good share carry non-numeric extras (letters/%/parens/unicode minus)
+    dirty = sum(1 for v in nonblank
+                if re.search(r"[%()a-zA-Z°]", v) or "−" in v or "–" in v)
+    return dirty >= max(2, 0.3 * len(nonblank))
+
+
+def _table_health(df: pd.DataFrame) -> list[str]:
+    """Cheap structural 'health report' surfaced up front so the model SEES data traps
+    (duplicate split columns, dirty numeric columns, Total rows, multi-line/blank cells)."""
+    warns: list[str] = []
+    cols = list(df.columns)
+
+    # 1. duplicate/split columns (pandas suffixes dupes as 'X.1', 'X.2')
+    split = [c for c in cols if re.match(r"^.+\.\d+$", str(c))
+             and re.sub(r"\.\d+$", "", str(c)) in cols]
+    if split:
+        bases = sorted({re.sub(r"\.\d+$", "", str(c)) for c in split})
+        warns.append(
+            f"DUPLICATE COLUMNS {split} share base name(s) {bases}: this table is likely "
+            "two sub-tables placed SIDE BY SIDE. To count/aggregate a logical column, "
+            "combine the duplicates (e.g. pd.concat([df['Position'], df['Position.1']]))."
+        )
+
+    # 2. dirty numeric columns
+    dirty_cols = []
+    for c in cols:
+        try:
+            vals = df[c].astype(str).tolist()
+        except Exception:  # noqa: BLE001
+            continue
+        if _looks_numeric_dirty(vals):
+            sample = next((v for v in vals if v.strip()), "")
+            dirty_cols.append(f"{c!r} (e.g. {sample!r})")
+    if dirty_cols:
+        warns.append(
+            "NUMERIC-BUT-DIRTY columns " + ", ".join(dirty_cols[:4]) + ": before any "
+            "numeric compare/sum, extract the number with a regex and normalize the minus "
+            r"sign, e.g. s = df[col].str.extract(r'([-−–]?[\d.,]+)')[0]"
+            ".str.replace('−','-').str.replace(',','').astype(float)."
+        )
+
+    # 3. Total / summary rows
+    if cols:
+        label_col = cols[0]
+        try:
+            labels = df[label_col].astype(str).str.strip().str.lower()
+            tot_rows = df.index[labels.isin(_SUMMARY_LABELS)].tolist()
+        except Exception:  # noqa: BLE001
+            tot_rows = []
+        if tot_rows:
+            warns.append(
+                f"SUMMARY ROW(S) at index {tot_rows} (label like 'Total'): exclude when "
+                "counting/summing data rows; use directly only if the question wants the total."
+            )
+
+    # 4. multi-line cells
+    multiline = False
+    for c in cols:
+        try:
+            if df[c].astype(str).str.contains("\n").any():
+                multiline = True
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if multiline:
+        warns.append(
+            "MULTI-LINE CELLS present (a cell holds several lines, e.g. 'Name\\n1291–1295'). "
+            "The gold answer may be the FULL cell text — keep all parts unless asked otherwise."
+        )
+
+    # 5. blank / placeholder cells
+    try:
+        flat = df.astype(str).to_numpy().ravel()
+        n_blank = sum(1 for v in flat if v.strip().lower() in _PLACEHOLDERS)
+        if n_blank:
+            warns.append(
+                f"{n_blank} BLANK/placeholder cell(s) (''/'-'/'–'/'N/A'): handle them "
+                "explicitly when filtering or counting (they are not real values)."
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 6. name variants that would split value_counts / groupby
+    for c in cols:
+        try:
+            vals = [v.strip() for v in df[c].astype(str).tolist() if v.strip()]
+        except Exception:  # noqa: BLE001
+            continue
+        distinct = list(dict.fromkeys(vals))
+        if len(distinct) < 5:                       # not an entity-like column
+            continue
+        if sum(1 for v in distinct if _NUM_RE.match(v)) > len(distinct) * 0.5:
+            continue                                # mostly numeric → skip
+        low = {v: v.lower() for v in distinct}
+        pairs = []
+        for a in distinct:
+            for b in distinct:
+                if a is b:
+                    continue
+                la, lb = low[a], low[b]
+                # b is a strict multi-word extension of a ("Penrhyn Quarry" ⊂
+                # "Penrhyn Quarry Railway"): the same entity written two ways.
+                if len(la) < len(lb) and lb.startswith(la + " "):
+                    pairs.append((a, b))
+        if pairs:
+            a, b = pairs[0]
+            warns.append(
+                f"POSSIBLE NAME VARIANTS in column {c!r} (e.g. {a!r} vs {b!r}): "
+                "value_counts/groupby would split the same entity across variants. "
+                "If you count or rank by this column, normalize variants first "
+                "(e.g. map them to a canonical name) and verify by printing the groups."
+            )
+            break  # one such column is enough signal
+
+    return warns
+
+
+def _cell_value_set(df: pd.DataFrame) -> set[str]:
+    """All distinct cell texts (lower/stripped) for membership checks."""
+    cells: set[str] = set()
+    for col in df.columns:
+        try:
+            for v in df[col].astype(str):
+                cells.add(v.strip().lower())
+        except Exception:  # noqa: BLE001
+            continue
+    return cells
+
+
+def split_joined_answer(items: list[str], df: pd.DataFrame) -> list[str]:
+    """Fix a multi-value answer wrongly collapsed into ONE delimited string.
+
+    e.g. answer ['1963, 1965'] for a list question becomes ['1963', '1965'].
+    High precision: only split a single item when the whole string is NOT itself a
+    real cell, but EVERY split piece appears as a complete cell in the table.
+    """
+    if len(items) != 1:
+        return items
+    s = items[0].strip()
+    if not s:
+        return items
+    cells = _cell_value_set(df)
+    if s.lower() in cells:
+        return items  # the joined text is a genuine single cell — keep it
+    for delim in (", ", "; ", " and "):
+        if delim in s:
+            parts = [p.strip() for p in s.split(delim) if p.strip()]
+            if len(parts) >= 2 and all(p.lower() in cells for p in parts):
+                return parts
+    return items
 
 
 def _scalar_str(x: Any) -> str:
@@ -58,11 +235,17 @@ class InspectTableTool(Tool):
         body = [tc.schema_text, "", "First rows:"]
         for row in tc.sample_rows:
             body.append("  " + " | ".join(f"{k}={v!r}" for k, v in row.items()))
-        text, truncated = truncate_text("\n".join(body), max_chars=3000)
+        warns = _table_health(tc.df)
+        if warns:
+            body.append("")
+            body.append("⚠ DATA HEALTH NOTES (check these before computing):")
+            body += [f"  • {w}" for w in warns]
+        text, truncated = truncate_text("\n".join(body), max_chars=3500)
         return ToolResult(
             ok=True,
             content_text=text,
-            structured={"columns": tc.columns, "n_rows": tc.n_rows},
+            structured={"columns": tc.columns, "n_rows": tc.n_rows,
+                        "health_warnings": warns},
             truncated=truncated,
         )
 
@@ -242,6 +425,9 @@ class SubmitAnswerTool(Tool):
         if not isinstance(items, list):
             items = [items]
         items = [str(x).strip() for x in items if str(x).strip() != ""]
+        # Repair a multi-value answer collapsed into one delimited string
+        # (e.g. ['1963, 1965'] -> ['1963', '1965']) when each piece is a real cell.
+        items = split_joined_answer(items, state.table_context.df)
         state.current_answer = items
         state.evidence = {"submitted": args.get("evidence")}
         return ToolResult(

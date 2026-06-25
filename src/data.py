@@ -147,6 +147,9 @@ QUICK_SEED = 13
 QUICK_SET_SIZE = 200
 FRESH_SEED = 29
 HOLDOUT_SEED = 41
+# Larger mining set for error attribution (run entirely on current code).
+MINE_SEED = 57
+MINE_SET_SIZE = 1000
 
 
 def _subset_ids(examples: list[Example], which: str) -> set[str]:
@@ -160,6 +163,10 @@ def _subset_ids(examples: list[Example], which: str) -> set[str]:
         used = _subset_ids(examples, "quick") | _subset_ids(examples, "fresh")
         pool = [e for e in examples if e.id not in used]
         return {e.id for e in sample_examples(pool, QUICK_SET_SIZE, HOLDOUT_SEED)}
+    if which == "mine":
+        # Deterministic 1000-example mining set (may overlap the 200-sets; that is
+        # fine — used for broad error attribution, not as a disjoint holdout).
+        return {e.id for e in sample_examples(examples, MINE_SET_SIZE, MINE_SEED)}
     raise ValueError(f"unknown eval subset: {which!r}")
 
 

@@ -37,7 +37,63 @@ others, you almost certainly included a summary row — recompute on `data`.
 - most / least of a numeric column:
   `s = data['Pts'].str.replace(',', '', regex=False).astype(float); answer = data.loc[s.idxmax(), 'Name']`
 
+## CRITICAL: "which/who had the most/least X" → return the ENTITY NAME
+After `idxmax`/`idxmin` you have the right ROW. Now return the column the question
+asks about — the descriptive **name** (Artist, Team, Player, Owner...), NOT a numeric
+id (Draw, Rank, No., #) and NOT the measure value (the points/score itself).
+```python
+i = s.idxmin()
+answer = data.loc[i, 'Artist']   # the name the question wants
+# NOT data.loc[i, 'Draw']  (that's just the row id)  — NOT s.min()  (that's the value)
+```
+Only return a number here if the question explicitly asks for one ("which YEAR/NUMBER
+had the most ...").
+
+## Counting YEARS / time spans — subtract real values, never row positions
+For "how many years before/since/between ...", compute from the actual Year/Date
+**values**, not the row index. The row index is a position, not a count of years
+(rows can skip years, and 0-based indices are off by one).
+```python
+start = int(df['Year'].iloc[0])
+first_pf = int(df.loc[df['Status'] == 'Partly Free', 'Year'].iloc[0])
+answer = first_pf - start          # years before the first Partly Free status
+# NOT df[df['Status']=='Partly Free'].index[0]  (that's a row position)
+```
+
+## Clean dirty values BEFORE comparing or summing (very common trap)
+Numbers are often wrapped in junk: units, parentheses, percent signs, a unicode
+minus `−` (U+2212, NOT the ascii `-`), thousands separators. Comparing these as
+strings gives wrong results (e.g. counting "scores less than -14" on raw text).
+Extract and normalize first:
+```python
+s = (df['Winning score']
+     .str.extract(r'([-−–]?\s*[\d.,]+)')[0]   # leading number, allow unicode minus
+     .str.replace('−', '-', regex=False)       # normalize minus
+     .str.replace(',', '', regex=False)
+     .astype(float))
+answer = int((s < -14).sum())
+```
+
+## Duplicate / split columns (side-by-side sub-tables)
+If inspect_table warns of columns like `Position` AND `Position.1`, the table is two
+sub-tables placed side by side. To count/aggregate the LOGICAL column, combine them:
+```python
+combined = pd.concat([df['Position'], df['Position.1']], ignore_index=True)
+answer = int((combined.str.strip().str.lower() == 'philanthropist').sum())
+```
+
+## Verify a count by printing the matched rows
+For counts, print what you matched and eyeball it before trusting `len()`:
+```python
+hits = data[data['Col'].str.contains('philanthropist', case=False, na=False)]
+print(hits[['Col']]); answer = int(len(hits))
+```
+
 ## Mistakes to avoid
 - Counting/summing the Total row (recompute on `data`).
-- Forgetting to strip ',' / units / '%' before casting to number.
+- Forgetting to strip ',' / units / '%' / unicode minus before casting to number.
 - Counting blank rows or sub-header rows.
+- Counting only one of two duplicate/split columns (combine them first).
+- For "which had the most/least X", returning the numeric id (Draw/Rank/No.) or the
+  measure value instead of the entity NAME the question asks for.
+- Using a row index/position as a number of years or items (subtract real values).
