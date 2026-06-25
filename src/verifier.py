@@ -374,27 +374,50 @@ Check the answer along THREE axes:
 
 A. FORM / PRECISION — Is each answer item copied EXACTLY as it appears in the
    relevant table cell? The gold answer almost always uses the TABLE'S OWN format. Flag if:
-   - a number is rounded/reformatted differently from the cell (e.g. "15.5" when the
-     cell says "15.5%", "1200" when the cell says "1,200", zero-padded "0:02:14" when
-     the natural value is "2:14") — keep units, symbols, separators, and minimal format;
+   - a value COPIED from a cell is rounded/reformatted differently from that cell (e.g.
+     "15.5" when the cell says "15.5%", or an abbreviation expanded) — keep the cell's
+     units, symbols, separators, and minimal format.
+   - DO NOT demand thousands separators on a COMPUTED number. A count/sum/difference/
+     average is gold-scored as PLAIN digits, and adding a comma ("2121" -> "2,121") makes
+     it WRONG (the scorer parses "2,121" as text, not the number 2121). Only keep a comma
+     if the value is copied verbatim from a cell that has one. Never flag a plain computed
+     number as "missing a comma".
    - a unit/symbol is added or removed (%, $, *, °);
    - an abbreviation is expanded (e.g. "United States" when the cell says "USA");
    - a non-English title is TRANSLATED or romanized when the question asks for the title:
      return the ORIGINAL-script cell (e.g. the "Episode title" column), NOT a separate
      "Translation"/"Romanized" column, unless the question explicitly asks for that;
    - part of a multi-part cell is dropped (e.g. a name that also carries dates/qualifiers).
-B. INTENT — Does the answer TYPE match what the question asks?
-   - A question wanting a name/label must not be answered with a number (and vice versa).
-   - ARGMAX questions ("which/who had the most/least/highest/lowest X") want the ROW
-     LABEL (the name), NOT the value of X. Flag "5" when the answer should be the entry
-     whose points were 5.
-   - "what is the highest/largest X" when X identifies an item (e.g. "highest percentage
-     of speakers other than Polish") usually wants the ITEM (the language/name), not the
-     number — read what the gold-style answer should be.
-   - A singular question ("who", "the only/first X", "which <singular noun>") must return
-     exactly ONE item, not a list. A clearly plural/"all" question may return several.
+B. INTENT — Does the answer match what the question asks, read AGAINST THIS TABLE?
+   Think about what each word means in the CONTEXT of this specific table, then check the
+   answer fits that meaning:
+   - COMPARATIVE / SUPERLATIVE DIRECTION. "higher/better/top rank" means a BETTER result —
+     and you must work out what "better" maps to HERE. A Rank/Position of 1 is the TOP, so
+     "ranked higher" = the SMALLEST rank number (or, if the leading rows' rank cell is
+     blank because the table is sorted by result, the EARLIER row). For a points/score
+     column, bigger = better. Flag the answer if the solver clearly went the WRONG
+     direction (e.g. called rank 4 "higher" than rank 2, or picked the smallest points as
+     "most"). Re-read the table to decide the direction before flagging.
+   - ANSWER TYPE. A question wanting a name/label must not be answered with a number (and
+     vice versa). ARGMAX questions ("which/who had the most/least X") want the ROW LABEL —
+     the descriptive NAME, not a numeric id, not a code/reference (e.g. a catalogue id like
+     "PHQ 4"), and not the measure value itself. "what is the highest/largest X" where X
+     identifies an item usually wants the ITEM (the language/name), not the number.
+   - CARDINALITY. A singular question ("who", "the only/first X", "which <singular noun>")
+     must return exactly ONE item; a clearly plural/"all"/"two" question may return several.
 C. COUNTING / AGGREGATION — For counts/sums/averages/extremes, is there an OBJECTIVE
    mistake — e.g. a Total/summary row wrongly included, or a clearly double-counted row?
+   REVIEW the list of values the student matched (like checking scratch paper — scan, do
+   not recompute). Flag ONLY when you can SEE a concrete problem in that printed list:
+   - DUPLICATE ENTITY: the student counted ROWS for a recurring real-world entity
+     (people, countries, teams) and the printed names visibly REPEAT (e.g. "John T.
+     Jordan" twice) → the count should likely be DISTINCT. (Only for entities that recur;
+     for EVENTS/occurrences — games, appearances, wins — repeats are real, do NOT flag.)
+   - MISSED VARIANT: the student used an exact match and the column clearly contains the
+     SAME item written differently (accent "Salomé", suffix "Salome, Op. 55") that was
+     left out → the match was too strict.
+   Quote the specific repeated/variant value as evidence. If you cannot point to a
+   concrete duplicate or variant in the list, do NOT raise a counting concern.
 
 ═══ INTERPRETATION GUARD (read before flagging) ═══
 This dataset uses NATURAL, EVERYDAY phrasing. Take the question at face value with
@@ -403,11 +426,16 @@ interpret the question differently. In particular, these are the SOLVER's call, 
 yours — do NOT flag them:
 - "majority / most" → the option that occurs most often (plurality). Do NOT demand
   strictly more than 50%.
-- "how many / total number of X" → usually the COUNT OF ROWS matching X. Do NOT
-  demand de-duplication unless the question literally says "distinct"/"different".
-- "next / previous / after / before X (listed)" → the ADJACENT ROW in the table's
-  given order (positional), NOT chronological order, unless the question says "earliest"/
-  "latest"/"chronologically".
+- "how many / total number of X" → for EVENTS/occurrences (games, appearances, wins)
+  this is the COUNT OF ROWS; do NOT demand de-duplication. BUT for recurring ENTITIES
+  (people, countries, teams) the gold often counts DISTINCT ones — so flag a row-count
+  ONLY if you can SEE repeated entity names in the student's matched list (axis C).
+- "next / previous / after / before X" → trust the solver's chosen axis. If the
+  question says "listed"/"in the table" it is the adjacent ROW; if there is a
+  Year/Date/Rank column it is the neighbour along THAT value. Do NOT flag a defensible
+  axis choice — but DO flag if the solver clearly used row +/- 1 while the table is
+  sorted so that the row neighbour is the wrong direction in time (e.g. descending
+  years and "after" returned an earlier year).
 - ordering, ties, inclusive/exclusive ranges when the question is silent → trust the solver.
 
 ONLY flag when you are highly confident the answer is OBJECTIVELY wrong (wrong cell,
@@ -495,6 +523,16 @@ VALID flaws to flag (a concrete, OBJECTIVE mechanical error in a specific step):
 - Total row included: "Step 3 summed all rows including the 'Total' row, double-counting"
 - Truncated cell: "The answer '4x400 m' is a substring of cell '4x400 m relay' — use the full cell"
 - Type mismatch: "The answer is a number but the question clearly asks for a name/label"
+- Wrong direction for a comparative/superlative: think about what "higher/better/most/
+  longer" means in THIS table, then flag if the code went the wrong way — e.g. it treated
+  the LARGER rank number as "higher rank" (rank 1 is the top), or took the smallest value
+  as "most". Re-read the table to confirm the intended direction before flagging.
+- Counting the wrong granularity — scan the student's printed matched list:
+  * DUPLICATE ENTITY: a row count for a recurring entity (people/countries/teams) whose
+    printed names visibly repeat ("John T. Jordan" twice) → likely needs DISTINCT. (Not
+    for events/occurrences — games, appearances — where repeats are real.)
+  * MISSED VARIANT: an exact `==` match that skipped the same item written differently
+    (accent "Salomé", suffix "Salome, Op. 55"). Quote the repeated/variant value.
 - Code bug: the code crashed, used the wrong variable, or its printed output contradicts the answer
 
 ═══ INTERPRETATION GUARD — DO NOT cross this line ═══
@@ -503,10 +541,12 @@ table and OWNS the interpretation of ambiguous wording. You must NOT flag a step
 merely because YOU would interpret the question differently. Specifically, these are
 NOT flaws — treat them as the student's correct call:
 - "majority / most" meaning the most frequent option (plurality), not strictly >50%.
-- "how many / total number of X" meaning a COUNT OF ROWS, not distinct/unique values
-  (unless the question literally says "distinct" / "different").
-- "next / after / before (listed)" meaning the ADJACENT ROW in the given order, not
-  chronological order (unless the question says "earliest"/"latest"/"chronologically").
+- "how many / total number of X" meaning a COUNT OF ROWS for EVENTS/occurrences (games,
+  appearances, wins) — do NOT demand de-dup there. (For recurring ENTITIES — people,
+  countries, teams — only flag a row count if you SEE repeated names in the printed list.)
+- "next / after / before" along whatever axis the student reasonably chose (listed row
+  order, or a Year/Date/Rank value) — do NOT flag a defensible axis choice; only flag a
+  clear direction error (e.g. a descending-year table where "after" returned an earlier year).
 - choosing .count() vs .nunique(), >= vs >, inclusive vs exclusive when the question
   is SILENT — the student decides; do NOT flag.
 

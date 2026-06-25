@@ -45,6 +45,8 @@ _SKILL_TRIGGERS: dict[str, tuple[str, ...]] = {
         r"\bdifference\b", r"\baverage\b", r"\bmean\b", r"\bcount\b",
         r"\bmost\b", r"\bleast\b", r"\bhighest\b", r"\blowest\b", r"\bfewest\b",
         r"\bgreatest\b", r"\bmaximum\b", r"\bminimum\b", r"\bmore\b", r"\bfewer\b",
+        r"\brank(ed|ing|s)?\b", r"\bhigher\b", r"\blower\b", r"\blongest\b",
+        r"\bshortest\b", r"\bbiggest\b", r"\bsmallest\b", r"\blargest\b",
     ),
     "positional": (
         r"\bnext\b", r"\bprevious\b", r"\bbefore\b", r"\bafter\b", r"\bpreceding\b",

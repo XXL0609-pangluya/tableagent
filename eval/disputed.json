@@ -8,6 +8,8 @@
     "nt-8912": "Q asks 'which region has more than one format' but gold='United States' only; United States, The Netherlands AND Worldwide each appear with >1 distinct Format, so the gold is under-specified.",
     "nt-6926": "Q 'how many times was War Memorial Stadium the game site' — the Game site column contains EXACTLY 7 rows equal to 'War Memorial Stadium' (weeks 2,4,6,7,8,9,13), but gold='6'. The table contradicts the gold; 7 is the verifiable count.",
     "nt-1642": "Q 'name the only american who did not finish the race' requires NATIONALITY, but the table has no nationality column (cols: Class/No/Team/Drivers/Chassis/Engine/Laps). The answer (Masten Gregory is American) is not derivable from the table — needs external world knowledge.",
-    "nt-517": "Q 'does Lafayette or Benton HS have green and grey as their colors' requires SCHOOL COLORS, but the table has no colors column (cols: School/Team Name/Town/County/Enrollment/class). Not derivable from the table — needs external world knowledge."
+    "nt-517": "Q 'does Lafayette or Benton HS have green and grey as their colors' requires SCHOOL COLORS, but the table has no colors column (cols: School/Team Name/Town/County/Enrollment/class). Not derivable from the table — needs external world knowledge.",
+    "nt-9087": "Q 'which venue is listed the most' — SIX venues tie at 2 occurrences (Tokyo, Barcelona, Helsinki, Atlanta, Athens, Sydney). gold='Athens, Greece' is one arbitrary pick among the tie; not uniquely determinable.",
+    "nt-2868": "Q 'which country or region had the most releases' — 'United States' and 'Worldwide' BOTH appear 4 times (a tie). gold='Worldwide' is one of two equally valid answers."
   }
 }

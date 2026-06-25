@@ -49,6 +49,24 @@ answer = data.loc[i, 'Artist']   # the name the question wants
 Only return a number here if the question explicitly asks for one ("which YEAR/NUMBER
 had the most ...").
 
+Prefer the human-readable TITLE/NAME column, not a code/reference/abbreviation. E.g.
+"which card was issued most" → the card's name (`Royal Wedding (The Princess Anne)`),
+NOT its catalogue ref (`PHQ 4`). If several columns could be "the name", pick the
+descriptive one, not the short id/code.
+
+## Comparative / superlative words: decide what they mean IN THIS TABLE first
+"higher / better / top / most / longer / leading" all mean "a BETTER result" — but what
+counts as "better" depends on the column you measure and how THIS table is built. Do not
+assume a fixed direction. Before computing, ask:
+- Which column does the word refer to? ("higher rank" → the Rank/Position; "most points"
+  → the points column; "longest term" → a duration you may have to compute from dates.)
+- For that column, does a BIGGER number mean better, or SMALLER? A Rank/Position of 1 is
+  the TOP, so "higher/better rank" = the SMALLEST rank number. Points/score: bigger = better.
+- Is the table already SORTED by result, with the leading rows' rank cell left BLANK? Then
+  a blank rank is the BEST, not the worst — row position is the real ranking.
+Read a few rows and state the mapping ("here higher rank = smaller number = earlier row")
+before you pick `idxmax`/`idxmin`/position. Then verify by printing the candidate rows.
+
 ## Counting YEARS / time spans — subtract real values, never row positions
 For "how many years before/since/between ...", compute from the actual Year/Date
 **values**, not the row index. The row index is a position, not a count of years
@@ -82,11 +100,40 @@ combined = pd.concat([df['Position'], df['Position.1']], ignore_index=True)
 answer = int((combined.str.strip().str.lower() == 'philanthropist').sum())
 ```
 
-## Verify a count by printing the matched rows
-For counts, print what you matched and eyeball it before trusting `len()`:
+## Verify a count by printing the matched rows — then SCAN the list like a human
+For counts, ALWAYS print the matched VALUES (not just the number) and read the list
+before trusting `len()`. A quick scan catches the two most common counting traps:
 ```python
 hits = data[data['Col'].str.contains('philanthropist', case=False, na=False)]
-print(hits[['Col']]); answer = int(len(hits))
+print(hits['Col'].tolist()); answer = int(len(hits))
+```
+
+### Trap 1 — the same ENTITY appears on several rows (count DISTINCT, not rows)
+When you count real-world ENTITIES that can recur — people, countries, teams, clubs —
+the same one often spans several rows (multiple terms, seasons, years). Scan the printed
+names: if any repeat, you almost certainly want DISTINCT, not row count.
+```python
+names = df[df['Name'].str.startswith('John')]['Name'].tolist()
+print(names)                          # e.g. ['John T. Jordan','John T. Jordan','John Collins',...]
+answer = df[df['Name'].str.startswith('John')]['Name'].nunique()   # distinct people
+```
+(But when you count EVENTS/occurrences — games, appearances, matches, wins — repeats are
+real and row count is correct. Decide which one the question asks for.)
+
+### Trap 2 — the same thing is written several ways (don't miss VARIANTS)
+Exact `==` misses spelling variants: accents ("Salome" vs "Salomé"), suffixes
+("Salome" vs "Salome, Op. 55"), trailing qualifiers. So BEFORE counting a text label,
+FIRST print the column's UNIQUE values to see every way the target is written — the
+missing variants will NEVER show up if you only look at the rows you already matched:
+```python
+print(df['Title'].unique())     # reveals 'Salomé', 'Salome, Op. 55', 'Salome, Op. 19' ...
+```
+Then match by normalized contains, not `==`:
+```python
+import unicodedata
+def norm(s): return ''.join(c for c in unicodedata.normalize('NFKD', str(s)) if not unicodedata.combining(c)).lower()
+titles = df['Title'][df['Title'].apply(lambda t: norm(t).startswith('salome'))]
+print(titles.tolist()); answer = int(len(titles))
 ```
 
 ## Mistakes to avoid
@@ -94,6 +141,7 @@ print(hits[['Col']]); answer = int(len(hits))
 - Forgetting to strip ',' / units / '%' / unicode minus before casting to number.
 - Counting blank rows or sub-header rows.
 - Counting only one of two duplicate/split columns (combine them first).
-- For "which had the most/least X", returning the numeric id (Draw/Rank/No.) or the
-  measure value instead of the entity NAME the question asks for.
+- For "which had the most/least X", returning the numeric id (Draw/Rank/No.), a
+  code/reference (PHQ 4), or the measure value instead of the entity NAME asked for.
+- Treating "higher/better rank" as a larger number — rank 1 is the TOP.
 - Using a row index/position as a number of years or items (subtract real values).
