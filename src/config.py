@@ -22,6 +22,7 @@ class LLMConfig:
     base_url: str
     api_key: str
     model: str
+    protocol: str = "openai"  # "openai" | "anthropic"
     temperature: float = 0.0
     max_tokens: int = 1024
     timeout_s: float = 60.0
@@ -35,6 +36,16 @@ def _min_interval() -> float:
         return float(os.environ.get("LLM_MIN_INTERVAL_S", "0") or "0")
     except ValueError:
         return 0.0
+
+
+def _infer_protocol(model: str, override: Optional[str]) -> str:
+    if override:
+        p = override.strip().lower()
+        if p in ("openai", "anthropic"):
+            return p
+    if (model or "").strip().lower().startswith("claude"):
+        return "anthropic"
+    return "openai"
 
 
 def load_llm_config(
@@ -51,6 +62,8 @@ def load_llm_config(
         base_url=base_url,
         api_key=api_key,
         model=model or os.environ.get("LLM_MODEL", "deepseek-v4-flash"),
+        protocol=_infer_protocol(model or os.environ.get("LLM_MODEL", "deepseek-v4-flash"),
+                                 os.environ.get("LLM_PROTOCOL")),
         temperature=0.0 if temperature is None else temperature,
         min_interval_s=_min_interval(),
     )
@@ -72,7 +85,9 @@ def load_verifier_config(model: Optional[str] = None) -> LLMConfig:
         # default to the "other" cheap model so it differs from the solver
         or ("deepseek-v4-flash" if solver_model != "deepseek-v4-flash" else "qwen3.6-35b-a3b")
     )
+    verifier_protocol = _infer_protocol(verifier_model, os.environ.get("VERIFIER_PROTOCOL"))
     if not base_url or not api_key:
         raise RuntimeError("VERIFIER/LLM base_url or api_key missing in .env")
     return LLMConfig(base_url=base_url, api_key=api_key, model=verifier_model,
-                     temperature=0.0, min_interval_s=_min_interval())
+                     protocol=verifier_protocol, temperature=0.0,
+                     min_interval_s=_min_interval())

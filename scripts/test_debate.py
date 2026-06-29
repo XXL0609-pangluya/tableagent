@@ -137,6 +137,22 @@ def print_trace(trace_events: list[dict]) -> None:
             print(f"  [step {step}] LLM ERROR → {note}")
 
 
+def preflight_client(name: str, client: LLMClient) -> bool:
+    """Fail fast on endpoint/model connectivity issues before a long run."""
+    try:
+        resp = client.chat(
+            messages=[{"role": "user", "content": "Reply with exactly: OK"}],
+            max_tokens=16,
+            temperature=0.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"{name} preflight FAILED: {type(exc).__name__}: {exc}")
+        return False
+    txt = (resp.text or "").strip()
+    print(f"{name} preflight OK (reply={txt!r})")
+    return True
+
+
 def run_single(ex, client: LLMClient, verifier_client: LLMClient,
                registry, prompts, budget: Budget) -> dict:
     from src.data import load_table
@@ -159,6 +175,7 @@ def run_single(ex, client: LLMClient, verifier_client: LLMClient,
         "correct": correct,
         "src": ev.get("answer_source"),
         "verify": ev.get("verify"),
+        "verify_history": ev.get("verify_history", []),
         "steps": ev.get("steps_used"),
         "trace": [e.__dict__ for e in tracer.events],
     }
@@ -205,6 +222,13 @@ def main() -> None:
     print(f"Generator model : {cfg.model}")
     print(f"Verifier  model : {vcfg.model}")
     print()
+    print("[preflight] checking solver/verifier connectivity ...")
+    ok_solver = preflight_client("solver", client)
+    ok_verifier = preflight_client("verifier", verifier_client)
+    if not (ok_solver and ok_verifier):
+        print("Preflight failed. Please fix endpoint/model connectivity before running the batch.")
+        raise SystemExit(2)
+    print()
 
     # Load all examples from the holdout split
     all_examples = load_examples("random-split-1-dev")
@@ -245,6 +269,10 @@ def main() -> None:
         if result.get("verify"):
             v = result["verify"]
             print(f"  VERIFY: ok={v.get('ok')} src={v.get('source')} issues={v.get('issues', [])}")
+        vh = result.get("verify_history") or []
+        if len(vh) > 1:
+            compact = [f"{'T' if x.get('ok') else 'F'}:{x.get('source')}" for x in vh]
+            print(f"  VERIFY_HISTORY: {compact}")
 
         print("\n  — Full trace —")
         print_trace(result.get("trace", []))

@@ -11,6 +11,8 @@ import random
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 from openai import OpenAI
 
@@ -46,11 +48,13 @@ class LLMResponse:
 class LLMClient:
     def __init__(self, config: Optional[LLMConfig] = None):
         self.config = config or load_llm_config()
-        self._client = OpenAI(
-            base_url=self.config.base_url,
-            api_key=self.config.api_key,
-            timeout=self.config.timeout_s,
-        )
+        self._client: Optional[OpenAI] = None
+        if self.config.protocol == "openai":
+            self._client = OpenAI(
+                base_url=self.config.base_url,
+                api_key=self.config.api_key,
+                timeout=self.config.timeout_s,
+            )
 
     def chat(
         self,
@@ -61,6 +65,15 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         model: Optional[str] = None,
     ) -> LLMResponse:
+        if self.config.protocol == "anthropic":
+            return self._chat_anthropic(
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                model=model,
+            )
+
         kwargs: dict[str, Any] = {
             "model": model or self.config.model,
             "messages": messages,
@@ -112,6 +125,8 @@ class LLMClient:
         for i in range(attempts):
             try:
                 _pace(self.config.min_interval_s)
+                if self._client is None:
+                    raise RuntimeError("OpenAI client is not initialized")
                 return self._client.chat.completions.create(**kwargs)
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
@@ -126,11 +141,140 @@ class LLMClient:
                 time.sleep(delay)
         raise last_exc  # type: ignore[misc]
 
+    def _anthropic_messages_url(self) -> str:
+        base = self.config.base_url.rstrip("/")
+        if base.endswith("/messages"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/messages"
+        return f"{base}/v1/messages"
+
+    @staticmethod
+    def _anthropic_text(raw: dict[str, Any]) -> str:
+        blocks = raw.get("content") or []
+        if not isinstance(blocks, list):
+            return ""
+        parts: list[str] = []
+        for blk in blocks:
+            if isinstance(blk, dict) and blk.get("type") == "text":
+                txt = blk.get("text")
+                if txt:
+                    parts.append(str(txt))
+        return "".join(parts)
+
+    @staticmethod
+    def _to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, str]]]:
+        system_parts: list[str] = []
+        out: list[dict[str, str]] = []
+        for m in messages:
+            role = str(m.get("role") or "user")
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content_text = " ".join(str(x) for x in content)
+            else:
+                content_text = str(content)
+            if role == "system":
+                if content_text.strip():
+                    system_parts.append(content_text)
+                continue
+            if role not in ("user", "assistant"):
+                # The verifier path only uses system/user. If other roles appear,
+                # fold them into a user note so the request still stays valid.
+                content_text = f"[{role}] {content_text}"
+                role = "user"
+            out.append({"role": role, "content": content_text})
+        if not out:
+            out = [{"role": "user", "content": ""}]
+        return "\n\n".join(system_parts).strip(), out
+
+    def _anthropic_create_with_retry(
+        self,
+        payload: dict[str, Any],
+        attempts: int = 6,
+        backoff_s: float = 2.0,
+    ) -> dict[str, Any]:
+        last_exc: Optional[Exception] = None
+        data = json.dumps(payload).encode("utf-8")
+        for i in range(attempts):
+            try:
+                _pace(self.config.min_interval_s)
+                req = urlrequest.Request(
+                    self._anthropic_messages_url(),
+                    data=data,
+                    method="POST",
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-api-key": self.config.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                )
+                with urlrequest.urlopen(req, timeout=self.config.timeout_s) as resp:
+                    body = resp.read().decode("utf-8")
+                return json.loads(body)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if i >= attempts - 1:
+                    break
+                msg = str(exc)
+                rate_limited = "429" in msg or "rate" in msg.lower()
+                if isinstance(exc, urlerror.HTTPError):
+                    try:
+                        err_body = exc.read().decode("utf-8", errors="ignore")
+                        rate_limited = rate_limited or ("429" in err_body)
+                    except Exception:  # noqa: BLE001
+                        pass
+                base = backoff_s * (4.0 if rate_limited else 1.0)
+                delay = min(base * (2 ** i), 60.0) + random.uniform(0, 1.5)
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    def _chat_anthropic(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        model: Optional[str],
+    ) -> LLMResponse:
+        if tools:
+            raise RuntimeError(
+                "Anthropic protocol path currently supports verifier-style text calls only "
+                "(tool-calling for generator is not implemented yet)."
+            )
+        system, anthropic_msgs = self._to_anthropic_messages(messages)
+        payload: dict[str, Any] = {
+            "model": model or self.config.model,
+            "max_tokens": max_tokens or self.config.max_tokens,
+            "messages": anthropic_msgs,
+            "temperature": self.config.temperature if temperature is None else temperature,
+        }
+        if system:
+            payload["system"] = system
+        raw = self._anthropic_create_with_retry(payload)
+        usage_raw = raw.get("usage") or {}
+        input_toks = int(usage_raw.get("input_tokens") or 0)
+        output_toks = int(usage_raw.get("output_tokens") or 0)
+        usage = {
+            "prompt_tokens": input_toks,
+            "completion_tokens": output_toks,
+            "total_tokens": input_toks + output_toks,
+        }
+        return LLMResponse(
+            text=self._anthropic_text(raw),
+            tool_calls=[],
+            finish_reason=str(raw.get("stop_reason") or ""),
+            usage=usage,
+            raw=raw,
+        )
+
     def probe_native_tools(self) -> tuple[bool, str]:
         """Check whether the model supports native function calling.
 
         Returns (supported, detail). 'detail' is a short human-readable note.
         """
+        if self.config.protocol == "anthropic":
+            return False, "anthropic protocol path does not expose native tool-calling in this client"
         probe_tool = [{
             "type": "function",
             "function": {

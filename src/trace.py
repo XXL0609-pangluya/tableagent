@@ -19,7 +19,10 @@ def _to_jsonable(obj: Any) -> Any:
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         return {k: _to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
     if isinstance(obj, dict):
-        return {_to_jsonable(k) if not isinstance(k, str) else k: _to_jsonable(v)
+        # JSON object keys MUST be strings. A non-string key (e.g. a tuple from a
+        # pandas to_dict) must be stringified — never passed through _to_jsonable,
+        # which would turn a tuple into an (unhashable) list and crash the dict build.
+        return {(k if isinstance(k, str) else str(k)): _to_jsonable(v)
                 for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
         return [_to_jsonable(v) for v in obj]
@@ -54,15 +57,17 @@ class Tracer:
         """Append one JSON record. Never raises into the caller: trace logging must
         not be able to discard a successful prediction (it once did — a stray numpy
         scalar made json.dumps throw and the run loop treated it as a failed example)."""
-        record = {
-            "trace_id": self.trace_id,
-            "example_id": self.example_id,
-            "elapsed_ms": round((time.time() - self._t0) * 1000, 1),
-            "events": [_to_jsonable(e) for e in self.events],
-        }
-        if extra:
-            record["meta"] = _to_jsonable(extra)
         try:
+            # Build AND serialize inside the guard: _to_jsonable itself can raise on
+            # exotic leaves/keys, and that must never crash the run loop.
+            record = {
+                "trace_id": self.trace_id,
+                "example_id": self.example_id,
+                "elapsed_ms": round((time.time() - self._t0) * 1000, 1),
+                "events": [_to_jsonable(e) for e in self.events],
+            }
+            if extra:
+                record["meta"] = _to_jsonable(extra)
             line = json.dumps(record, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001 — last-resort minimal record
             line = json.dumps({

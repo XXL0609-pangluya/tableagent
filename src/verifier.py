@@ -17,6 +17,7 @@ a good answer with a worse one (it can only trigger a re-derivation).
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -26,6 +27,9 @@ import pandas as pd
 from .evaluator import check_denotation, to_value_list
 from .llm import LLMClient
 from .sandbox import run_code
+
+
+_ENABLE_COUNT_CHECK = os.environ.get("VERIFY_COUNT_CHECK", "0").strip() == "1"
 
 
 @dataclass
@@ -51,7 +55,8 @@ class VerifyResult:
     def to_dict(self) -> dict[str, Any]:
         return {"ok": self.ok, "issues": self.issues, "fix_hint": self.fix_hint,
                 "source": self.source, "axis": self.axis, "model": self.model,
-                "recomputed": self.recomputed, "compute_match": self.compute_match}
+                "recomputed": self.recomputed, "compute_match": self.compute_match,
+                "verifier_reasoning": self.verifier_reasoning, "raw": self.raw}
 
 
 def answers_match(a: list[str], b: list[str]) -> bool:
@@ -221,6 +226,17 @@ _SUMMARY_ANSWER_LABELS = {
     "averages", "avg", "mean", "overall", "all", "n/a", "—", "-",
 }
 
+# Question forms where a pre-audit "browse the table first" stage is worthwhile.
+_BROWSE_RE = re.compile(
+    r"\b(how many|number of|count|total|sum|average|difference|next|previous|before|after|"
+    r"first|last|most|least|highest|lowest|top|maximum|minimum|larger|smaller|higher|lower)\b",
+    re.I,
+)
+_COUNT_Q_RE = re.compile(
+    r"\b(how many|number of|count|total|sum|average|at most|at least|no more than|no less than)\b",
+    re.I,
+)
+
 
 def summary_label_issues(question: str, items: list[str]) -> list[str]:
     """B/C-axis (high precision): the answer is a summary-row LABEL like 'Total'.
@@ -235,6 +251,64 @@ def summary_label_issues(question: str, items: list[str]) -> list[str]:
             f"The answer '{items[0]}' is a SUMMARY/total-row label, not a real data "
             "entity. Exclude summary rows (Total/Average/...) before taking the "
             "first/last/most/least, then return the actual data row."
+        ]
+    return []
+
+
+def comparative_choice_issues(question: str, items: list[str]) -> list[str]:
+    """B-axis: strict choice questions should return canonical tokens.
+
+    Example: "greater than, equal to, or less than" should return one of
+    {"greater", "equal", "less"} (not free-form variants).
+    """
+    q = (question or "").lower()
+    if not re.search(r"\bgreater than\b", q) or not re.search(r"\bless than\b", q):
+        return []
+    if len(items) != 1:
+        return []
+    ans = (items[0] or "").strip().lower()
+    if ans in {"greater", "equal", "less"}:
+        return []
+    if ans in {"greater than", "more than"}:
+        return ["For this comparison question, use canonical choice token 'greater'."]
+    if ans in {"less than", "fewer than"}:
+        return ["For this comparison question, use canonical choice token 'less'."]
+    if ans in {"equal to", "same", "the same"}:
+        return ["For this comparison question, use canonical choice token 'equal'."]
+    return []
+
+
+def fullname_label_issues(question: str, items: list[str], df: "pd.DataFrame") -> list[str]:
+    """A/B-axis: if answer is a shortened name while a unique longer table cell matches.
+
+    Conservative: only fire on who/which-person style questions with a single
+    non-numeric answer and exactly one longer cell ending with this answer.
+    """
+    q = (question or "").lower()
+    if not re.search(r"\bwho\b", q):
+        return []
+    if len(items) != 1:
+        return []
+    ans = (items[0] or "").strip()
+    if not ans or _is_number(ans):
+        return []
+    al = ans.lower()
+    matches: set[str] = set()
+    for col in df.columns:
+        for val in df[col].astype(str).unique():
+            v = val.strip()
+            if not v:
+                continue
+            vl = v.lower()
+            if vl == al:
+                return []
+            if vl.endswith(al) and len(vl) > len(al):
+                matches.add(v)
+    if len(matches) == 1:
+        m = next(iter(matches))
+        return [
+            f"The answer '{ans}' looks like a shortened form; the table has full label '{m}'. "
+            "Return the full cell text."
         ]
     return []
 
@@ -358,7 +432,77 @@ def deterministic_issues(question: str, items: list[str]) -> list[str]:
     # are legitimately numbers — so it is intentionally NOT wired in (net-harmful).
     # B/C-axis: the answer is a summary-row label (Total/Average/...).
     issues += summary_label_issues(question, items)
+    issues += comparative_choice_issues(question, items)
     return issues
+
+
+def _as_number(item: str) -> Optional[float]:
+    try:
+        return float(item.replace(",", "").strip())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def appear_in_column_count_issues(question: str, items: list[str], df: "pd.DataFrame") -> list[str]:
+    """C-axis deterministic check for 'how many times does X appear in Y column'."""
+    q = (question or "").strip()
+    m = re.search(
+        r"how many times does\s+(.+?)\s+appear in (?:the\s+)?(.+?)\s+column",
+        q,
+        re.I,
+    )
+    if not m or len(items) != 1:
+        return []
+    term = m.group(1).strip().strip("'\"")
+    col_ref = m.group(2).strip().lower()
+    if not term:
+        return []
+
+    # Resolve column by case-insensitive exact name first, then substring.
+    cols = list(df.columns)
+    target_col = None
+    for c in cols:
+        if c.strip().lower() == col_ref:
+            target_col = c
+            break
+    if target_col is None:
+        for c in cols:
+            if col_ref in c.strip().lower():
+                target_col = c
+                break
+    if target_col is None:
+        return []
+
+    pred_num = _as_number(items[0])
+    if pred_num is None:
+        return []
+
+    series = df[target_col].astype(str).str.lower().str.strip()
+    t = term.lower()
+    # Word-boundary-ish match to reduce accidental substring noise.
+    pattern = re.compile(r"(^|\\b)" + re.escape(t) + r"(\\b|$)")
+    count = int(series.str.contains(pattern, regex=True, na=False).sum())
+    if int(round(pred_num)) != count:
+        return [
+            f"Count mismatch in '{target_col}': '{term}' appears {count} times, but answer is {items[0]}."
+        ]
+    return []
+
+
+def non_distinct_question_nunique_issues(question: str, code_history: str) -> list[str]:
+    """Flag suspicious de-duplication when question does not ask for distinct values."""
+    q = (question or "").lower()
+    if not re.search(r"\b(how many|number of|total number|total)\b", q):
+        return []
+    if re.search(r"\b(distinct|different|unique|each)\b", q):
+        return []
+    ch = (code_history or "").lower()
+    if ".nunique(" in ch or "nunique(" in ch or ".unique(" in ch:
+        return [
+            "Question asks total/how-many but reasoning used unique/distinct counting. "
+            "Re-check whether this should count rows/events instead of distinct values."
+        ]
+    return []
 
 
 # --------------------------------------------------------------------------
@@ -371,6 +515,12 @@ directly with this table and is PRESUMED CORRECT. Your job is to catch clear,
 objective mistakes — NOT to impose your own reading of an ambiguous question.
 
 Check the answer along THREE axes:
+
+Before judging, use this sequence:
+1) Read the Stage-1 browse notes (table-first observations/checks).
+2) Re-read the solver evidence/code intent.
+3) Decide whether there is a concrete contradiction.
+The browse notes are evidence, not a forced verdict.
 
 A. FORM / PRECISION — Is each answer item copied EXACTLY as it appears in the
    relevant table cell? The gold answer almost always uses the TABLE'S OWN format. Flag if:
@@ -453,15 +603,83 @@ def _parse_json(text: str) -> dict[str, Any]:
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
     try:
-        return json.loads(text)
+        out = json.loads(text)
+        if isinstance(out, dict):
+            out.setdefault("_parse_failed", False)
+        return out
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
             try:
-                return json.loads(m.group(0))
+                out = json.loads(m.group(0))
+                if isinstance(out, dict):
+                    out.setdefault("_parse_failed", False)
+                return out
             except json.JSONDecodeError:
                 pass
-    return {"pass": True, "axis": None, "issue": "", "fix_hint": ""}
+    return {"pass": True, "axis": None, "issue": "", "fix_hint": "", "_parse_failed": True}
+
+
+_BROWSE_SYSTEM = """You are the STAGE-1 table browser in a verifier pipeline.
+Do NOT decide correct/incorrect and do NOT produce a final answer.
+
+Your task:
+1) Classify question type as one of:
+   - count/aggregation
+   - position/order
+   - comparison/superlative
+   - lookup/format
+2) Browse the provided table snapshot and list 2-5 concrete observations that are
+   relevant for review (duplicates, variant spellings, ordering axes, boundary values,
+   summary rows, etc.) based on this question type.
+3) Propose 2-4 targeted review checks phrased as "check whether ...".
+
+Rules:
+- Evidence only; no verdict.
+- No generic advice; use concrete values/columns from the table text when possible.
+- If uncertain, output conservative observations and checks.
+
+Respond with JSON only:
+{
+  "qtype": "count/aggregation|position/order|comparison/superlative|lookup/format",
+  "observations": ["...", "..."],
+  "review_checks": ["check whether ...", "..."]
+}
+"""
+
+
+def browse_table(
+    client: LLMClient,
+    question: str,
+    table_view: str = "",
+    *,
+    max_tokens: int = 512,
+) -> str:
+    """Stage-1 progressive browse: table-first observations for later review."""
+    user = (
+        f"Question: {question}\n\n"
+        f"Table snapshot:\n{table_view or '(table not provided)'}\n"
+    )
+    try:
+        resp = client.chat(
+            messages=[{"role": "system", "content": _BROWSE_SYSTEM}, {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"(browse skipped: {type(exc).__name__}: {exc})"
+    raw = resp.text or ""
+    parsed = _parse_json(raw)
+    qtype = str(parsed.get("qtype") or "unknown").strip()
+    obs = parsed.get("observations") or []
+    checks = parsed.get("review_checks") or []
+    if not isinstance(obs, list):
+        obs = [str(obs)]
+    if not isinstance(checks, list):
+        checks = [str(checks)]
+    obs_txt = "; ".join(str(x).strip() for x in obs if str(x).strip()) or "(none)"
+    chk_txt = "; ".join(str(x).strip() for x in checks if str(x).strip()) or "(none)"
+    return f"type={qtype} | observations={obs_txt} | review_checks={chk_txt}"
 
 
 def llm_check(
@@ -470,12 +688,14 @@ def llm_check(
     items: list[str],
     table_view: str = "",
     evidence_summary: str = "",
+    browse_notes: str = "",
     *,
     max_tokens: int = 1024,  # headroom for reasoning models (content comes after CoT)
 ) -> VerifyResult:
     user = (
         f"Question: {question}\n\n"
         f"Proposed answer items: {json.dumps(items, ensure_ascii=False)}\n\n"
+        f"Stage-1 browse notes: {browse_notes or '(none)'}\n\n"
         f"Solver's evidence: {evidence_summary or '(none)'}\n\n"
         f"Table:\n{table_view or '(table not provided)'}\n"
     )
@@ -486,19 +706,92 @@ def llm_check(
             temperature=0.0,
         )
     except Exception as exc:  # noqa: BLE001 — verifier must never block the run
-        return VerifyResult(ok=True, source="none", model=client.config.model, raw=f"skipped: {exc}")
+        return VerifyResult(
+            ok=True,
+            source="none:llm_error",
+            model=client.config.model,
+            raw=f"skipped: {type(exc).__name__}: {exc}",
+        )
 
     raw = resp.text or ""
     parsed = _parse_json(raw)
+    if parsed.get("_parse_failed"):
+        return VerifyResult(ok=True, source="none:parse_error", model=client.config.model, raw=raw[:400])
     ok = bool(parsed.get("pass", True))
     issue = str(parsed.get("issue") or "").strip()
     axis = str(parsed.get("axis") or "").strip().upper()
     axis = axis if axis in ("A", "B", "C") else ""
     fix_hint = str(parsed.get("fix_hint") or "").strip()
-    if ok or not issue:
+    if ok:
         return VerifyResult(ok=True, source="none", model=client.config.model, raw=raw[:400])
+    if not issue:
+        return VerifyResult(
+            ok=True,
+            source="none:missing_issue",
+            model=client.config.model,
+            raw=raw[:400],
+        )
     return VerifyResult(ok=False, issues=[issue], fix_hint=fix_hint, source="llm",
                         axis=axis, model=client.config.model, raw=raw[:400])
+
+
+_COUNT_SYSTEM = """You are a strict numeric verifier for table QA COUNT/AGG questions.
+Focus on objective counting mechanics, not stylistic wording.
+
+Given question, proposed answer, browse notes, solver evidence, and table snapshot:
+1) Identify counted unit (rows/events/entities) and inclusion rule from wording.
+2) Check whether solver likely used wrong granularity (row vs distinct), wrong subset
+   filter (ignored qualifiers like women's/specific category), or wrong threshold.
+3) If there is a concrete contradiction, fail with one short issue and fix_hint.
+
+Conservative rule:
+- If evidence is insufficient, PASS (do not hallucinate).
+- If answer can be objectively checked from visible evidence and is inconsistent, FAIL.
+
+Respond JSON only:
+{"pass": true|false, "issue": "short", "fix_hint": "what to re-check"}
+"""
+
+
+def count_check(
+    client: LLMClient,
+    question: str,
+    items: list[str],
+    table_view: str = "",
+    evidence_summary: str = "",
+    browse_notes: str = "",
+    *,
+    max_tokens: int = 768,
+) -> VerifyResult:
+    user = (
+        f"Question: {question}\n\n"
+        f"Proposed answer items: {json.dumps(items, ensure_ascii=False)}\n\n"
+        f"Stage-1 browse notes: {browse_notes or '(none)'}\n\n"
+        f"Solver evidence: {evidence_summary or '(none)'}\n\n"
+        f"Table snapshot:\n{table_view or '(none)'}\n"
+    )
+    try:
+        resp = client.chat(
+            messages=[{"role": "system", "content": _COUNT_SYSTEM}, {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return VerifyResult(ok=True, source="none:count_error", model=client.config.model,
+                            raw=f"count skipped: {type(exc).__name__}: {exc}")
+    raw = resp.text or ""
+    parsed = _parse_json(raw)
+    if parsed.get("_parse_failed"):
+        return VerifyResult(ok=True, source="none:count_parse_error", model=client.config.model, raw=raw[:300])
+    ok = bool(parsed.get("pass", True))
+    issue = str(parsed.get("issue") or "").strip()
+    fix_hint = str(parsed.get("fix_hint") or "").strip()
+    if ok:
+        return VerifyResult(ok=True, source="none", model=client.config.model, raw=raw[:300])
+    if not issue:
+        return VerifyResult(ok=True, source="none:count_missing_issue", model=client.config.model, raw=raw[:300])
+    return VerifyResult(ok=False, issues=[issue], fix_hint=fix_hint, source="count",
+                        axis="C", model=client.config.model, raw=raw[:300])
 
 
 # --------------------------------------------------------------------------
@@ -515,8 +808,10 @@ You will receive:
 2. A sample of the table
 3. The student's proposed answer
 4. The student's run_python steps (code + outputs)
+5. Stage-1 browse notes (table-first observations and review checks)
 
 Your job: find ONE specific, concrete flaw in the student's code or reasoning, if any.
+Workflow: browse-notes first (table-level clues), then audit the student's code path.
 
 VALID flaws to flag (a concrete, OBJECTIVE mechanical error in a specific step):
 - Wrong column: "Step 1 filtered by column 'Winner' but the question asks about 'Runner-up'"
@@ -583,9 +878,9 @@ Your task:
    - Be specific: point to the counter-code step that fails or the original flaw that persists.
    - Your previous concern was: {previous_concern}
 
-BIAS TOWARD ACCEPTANCE: If the student ran code that is logically plausible and reaches a consistent
-conclusion — even if you might have done it differently — accept their approach. Only reject if you
-can point to a CONCRETE logical error in their code.
+RESOLUTION STANDARD: Accept only if the counter-code DIRECTLY addresses the previous concern with
+explicit table/code evidence. If the new answer changes but the core issue remains untested, keep
+the concern open and request one concrete check.
 
 Respond with JSON only:
 {{
@@ -604,6 +899,7 @@ def audit_check(
     items: list[str],
     code_history: str,
     table_view: str = "",
+    browse_notes: str = "",
     *,
     debate_round: int = 1,
     previous_concern: str = "",
@@ -637,6 +933,7 @@ def audit_check(
     user = (
         f"Question: {question}\n\n"
         f"Student's proposed answer: {items}\n\n"
+        f"Stage-1 browse notes:\n{browse_notes or '(none)'}\n\n"
         f"Table sample:\n{table_view or '(not provided)'}\n\n"
         f"Student's reasoning steps:\n{code_history or '(no code steps recorded)'}"
         f"{round_note}\n"
@@ -649,11 +946,17 @@ def audit_check(
             temperature=0.0,
         )
     except Exception as exc:  # noqa: BLE001
-        return VerifyResult(ok=True, source="none", model=client.config.model,
-                            raw=f"audit skipped: {exc}")
+        return VerifyResult(
+            ok=True,
+            source="none:audit_error",
+            model=client.config.model,
+            raw=f"audit skipped: {type(exc).__name__}: {exc}",
+        )
 
     raw = resp.text or ""
     parsed = _parse_json(raw)
+    if parsed.get("_parse_failed"):
+        return VerifyResult(ok=True, source="none:audit_parse_error", model=client.config.model, raw=raw[:300])
     flawed = bool(parsed.get("flawed", False))
     if not flawed:
         return VerifyResult(ok=True, source="audit", model=client.config.model, raw=raw[:300])
@@ -712,23 +1015,41 @@ def verify(
     # are intentionally NOT wired in. WTQ's multi-line gold is too inconsistent to snap.
     if debate_round <= 1:
         det = deterministic_issues(question, items)
+        if df is not None:
+            det += fullname_label_issues(question, items, df)
+            det += appear_in_column_count_issues(question, items, df)
+        det += non_distinct_question_nunique_issues(question, code_history)
         if det:
             return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
 
     if client is None or not use_llm:
         return VerifyResult(ok=True, source="none")
 
-    # Tier 2: A/B/C dimensional review (skip in follow-up rounds — focus on audit)
+    # Stage 1: progressive table browse (evidence only) for high-risk question forms.
+    browse_notes = ""
+    if debate_round <= 1 and _BROWSE_RE.search(question or ""):
+        browse_notes = browse_table(client, question, table_view)
+
+    # Tier 2: A/B/C dimensional review.
+    # In follow-up rounds we still run this for high-risk forms so a bad revised
+    # answer is not auto-accepted after one successful challenge.
     review: VerifyResult
-    if debate_round <= 1:
-        review = llm_check(client, question, items, table_view, evidence_summary)
+    if debate_round <= 1 or _BROWSE_RE.search(question or ""):
+        review = llm_check(client, question, items, table_view, evidence_summary, browse_notes)
     else:
         review = VerifyResult(ok=True, source="none")
+
+    # Tier 2c: count-specialized mechanical review (count/total/threshold questions).
+    count_review = (
+        count_check(client, question, items, table_view, evidence_summary, browse_notes)
+        if _ENABLE_COUNT_CHECK and _COUNT_Q_RE.search(question or "")
+        else VerifyResult(ok=True, source="none")
+    )
 
     # Tier 3: audit — round 1 is fresh; round 2+ checks counter-code
     audit = (
         audit_check(
-            client, question, items, code_history, table_view,
+            client, question, items, code_history, table_view, browse_notes,
             debate_round=debate_round,
             previous_concern=previous_concern,
         )
@@ -748,8 +1069,28 @@ def verify(
         ok = False
         issues += audit.issues
         sources.append("audit")
+    if not count_review.ok:
+        ok = False
+        issues += count_review.issues
+        axis = count_review.axis or axis
+        sources.append("count")
 
-    final_source = "+".join(sources) if sources else "none"
+    if sources:
+        final_source = "+".join(sources)
+    else:
+        # Preserve skip diagnostics (llm/audit errors, parse issues) instead of
+        # collapsing everything to plain "none".
+        diag = [s for s in (review.source, audit.source, count_review.source)
+                if isinstance(s, str) and s.startswith("none:")]
+        final_source = "+".join(diag) if diag else "none"
+    raw_parts = []
+    if review.raw:
+        raw_parts.append(f"review[{review.source}] {review.raw}")
+    if audit.raw:
+        raw_parts.append(f"audit[{audit.source}] {audit.raw}")
+    if count_review.raw:
+        raw_parts.append(f"count[{count_review.source}] {count_review.raw}")
+    merged_raw = " || ".join(raw_parts)[:800]
     return VerifyResult(
         ok=ok,
         issues=issues,
@@ -759,6 +1100,7 @@ def verify(
         model=client.config.model,
         verifier_code=audit.verifier_code,
         verifier_reasoning=audit.verifier_reasoning or review.fix_hint,
+        raw=merged_raw,
     )
 
 

@@ -18,6 +18,7 @@ def main() -> int:
     cfg = load_llm_config(model=model)
     print(f"base_url = {cfg.base_url}")
     print(f"model    = {cfg.model}")
+    print(f"protocol = {cfg.protocol}")
     print(f"api_key  = {cfg.api_key[:6]}...{cfg.api_key[-4:]}")
 
     client = LLMClient(cfg)

@@ -137,6 +137,10 @@ def _evidence_summary(state: AgentState) -> str:
     submitted = state.evidence.get("submitted")
     if submitted:
         parts.append(f"submitted_evidence: {submitted}")
+    rp_notes = state.evidence.get("run_python_notes") or []
+    if isinstance(rp_notes, list) and rp_notes:
+        joined = " || ".join(str(x) for x in rp_notes[-5:])
+        parts.append(f"run_python_notes: {joined}")
     return " | ".join(parts)[:600] if parts else "(none)"
 
 
@@ -152,15 +156,80 @@ def _code_signature(code: str) -> str:
     return "\n".join(lines).lower()
 
 
-def _table_view(tc: TableContext, max_rows: int = 30, max_chars: int = 2500) -> str:
-    """Compact table rendering for the verifier to inspect (schema + rows)."""
+def _concern_signature(issues: list[str], fix_hint: str) -> str:
+    """Normalize verifier concern text for drift detection across rounds."""
+    base = " | ".join(issues) if issues else (fix_hint or "")
+    base = re.sub(r"\s+", " ", (base or "").strip().lower())
+    # keep only semantic signal; drop noisy punctuation
+    return re.sub(r"[^a-z0-9 %:/\\-]", "", base)[:280]
+
+
+def _table_view(tc: TableContext, max_rows: int = 48, max_chars: int = 5200) -> str:
+    """Compact-but-broader table rendering for the verifier.
+
+    Progressive browsing needs more than just the first few rows. For long tables,
+    show a head+tail slice so the verifier can spot late-table duplicates/boundaries.
+    """
     lines = [tc.schema_text, "", "Rows:"]
     df = tc.df
-    for i in range(min(max_rows, len(df))):
+    n = len(df)
+    if n <= max_rows:
+        idxs = list(range(n))
+    else:
+        head = max_rows // 2
+        tail = max_rows - head
+        idxs = list(range(head)) + list(range(max(0, n - tail), n))
+    last_i = None
+    for i in idxs:
+        if last_i is not None and i != last_i + 1:
+            lines.append(f"  ... ({i - last_i - 1} rows omitted) ...")
         cells = " | ".join(f"{c}={str(df.iloc[i][c])}" for c in df.columns)
         lines.append(f"  [{i}] {cells}")
-    if len(df) > max_rows:
-        lines.append(f"  ... ({len(df) - max_rows} more rows)")
+        last_i = i
+    if n > max_rows:
+        lines.append(f"  ... (total rows: {n})")
+    text = "\n".join(lines)
+    return text if len(text) <= max_chars else text[:max_chars] + "\n…(truncated)"
+
+
+_BROWSE_HEAVY_RE = re.compile(
+    r"\b(how many|number of|count|total|sum|average|difference|most|least|highest|lowest|"
+    r"top|maximum|minimum|next|previous|before|after|larger|smaller|higher|lower)\b",
+    re.I,
+)
+
+
+def _verification_view(tc: TableContext, question: str, max_chars: int = 6200) -> str:
+    """Question-aware table slice for verifier prompts.
+
+    For browse-heavy/count-like questions, include a middle window in addition to
+    head/tail so the verifier can see recurring entities not visible in extremes.
+    Keep output bounded to avoid token blowups.
+    """
+    df = tc.df
+    n = len(df)
+    if n <= 64:
+        return _table_view(tc, max_rows=64, max_chars=max_chars)
+    if not _BROWSE_HEAVY_RE.search(question or ""):
+        return _table_view(tc, max_rows=48, max_chars=max_chars)
+
+    head_n = 20
+    mid_n = 24
+    tail_n = 20
+    mid_start = max(0, (n // 2) - (mid_n // 2))
+    mid_end = min(n, mid_start + mid_n)
+    idxs = list(range(head_n)) + list(range(mid_start, mid_end)) + list(range(max(0, n - tail_n), n))
+    idxs = sorted(set(i for i in idxs if 0 <= i < n))
+
+    lines = [tc.schema_text, "", "Rows:"]
+    last_i = None
+    for i in idxs:
+        if last_i is not None and i != last_i + 1:
+            lines.append(f"  ... ({i - last_i - 1} rows omitted) ...")
+        cells = " | ".join(f"{c}={str(df.iloc[i][c])}" for c in df.columns)
+        lines.append(f"  [{i}] {cells}")
+        last_i = i
+    lines.append(f"  ... (total rows: {n})")
     text = "\n".join(lines)
     return text if len(text) <= max_chars else text[:max_chars] + "\n…(truncated)"
 
@@ -192,7 +261,13 @@ def run_example(
     terminated = False
     verify_retries = 0
     last_verify: Optional[dict] = None
+    verify_history: list[dict] = []
+    incumbent_candidate: Optional[list[str]] = None
+    seen_concern_sigs: set[str] = set()
+    last_concern_sig: str = ""
+    repeated_concern_rounds = 0
     candidates: list[tuple[list[str], bool]] = []
+    drift_guard_enabled = os.environ.get("AGENT_DRIFT_GUARD", "0").strip() == "1"
     # Code history for the auditor: list of (code, output) strings from run_python calls.
     code_history_parts: list[str] = []
     # Anti-spiral: normalized signatures of recent run_python code, to detect when the
@@ -273,6 +348,22 @@ def run_example(
                     items_rp = result.structured.get("answer_items")
                     if items_rp:
                         last_run_items = items_rp
+                    rp_evidence = result.structured.get("evidence")
+                    rp_stdout = (result.structured.get("stdout") or "").strip()
+                    note_parts: list[str] = []
+                    if rp_evidence:
+                        note_parts.append(f"evidence={str(rp_evidence)[:160]}")
+                    if items_rp:
+                        note_parts.append(f"answer_items={items_rp}")
+                    if rp_stdout:
+                        one_line = " ".join(rp_stdout.splitlines())
+                        note_parts.append(f"stdout={one_line[:160]}")
+                    if note_parts:
+                        notes = state.evidence.setdefault("run_python_notes", [])
+                        if isinstance(notes, list):
+                            notes.append(" ; ".join(note_parts))
+                            if len(notes) > 8:
+                                del notes[:-8]
                     # Record for auditor: code + truncated output
                     code_snippet = args.get("code", "")[:600]
                     output_snippet = (result.content_text or "")[:300]
@@ -294,17 +385,22 @@ def run_example(
                 ))
             if result.terminate and name == "submit_answer" and result.ok:
                 candidate = list(state.current_answer or [])
+                if candidate and incumbent_candidate is None:
+                    incumbent_candidate = list(candidate)
                 code_history = "\n\n".join(code_history_parts)
                 vr = verify(
                     verifier_client or client, example.utterance, candidate,
                     df=table_context.df,
-                    table_view=_table_view(table_context),
+                    table_view=_verification_view(table_context, example.utterance),
                     evidence_summary=_evidence_summary(state),
                     code_history=code_history,
                     debate_round=verify_retries + 1,       # round 1 = fresh audit
                     previous_concern=last_debate_concern,  # empty on round 1
                 )
                 last_verify = vr.to_dict()
+                verify_history.append(last_verify)
+                if len(verify_history) > 10:
+                    del verify_history[:-10]
                 candidates.append((candidate, vr.ok))
                 if tracer:
                     tracer.add(TraceEvent(
@@ -315,6 +411,29 @@ def run_example(
                     # Record the concern so the next round's follow-up audit can
                     # reference it (multi-round debate memory).
                     current_concern = "; ".join(vr.issues) if vr.issues else (vr.fix_hint or "")
+                    concern_sig = _concern_signature(vr.issues, vr.fix_hint)
+                    has_new_concern = bool(concern_sig) and concern_sig not in seen_concern_sigs
+                    if concern_sig:
+                        if concern_sig == last_concern_sig:
+                            repeated_concern_rounds += 1
+                        else:
+                            repeated_concern_rounds = 0
+                        last_concern_sig = concern_sig
+                        seen_concern_sigs.add(concern_sig)
+
+                    # Drift guard: if concern repeats without new evidence, stop debate
+                    # and keep the incumbent instead of spiraling into unstable fallbacks.
+                    if drift_guard_enabled and concern_sig and (not has_new_concern) and repeated_concern_rounds >= 1:
+                        state.current_answer = list(incumbent_candidate or candidate)
+                        terminated = True
+                        if tracer:
+                            tracer.add(TraceEvent(
+                                step=step,
+                                kind="debate_stop",
+                                note=f"drift_guard: repeated concern without new evidence ({concern_sig[:80]})",
+                            ))
+                        continue
+
                     verify_retries += 1
                     # Keep the candidate in the pool; clear current so the model
                     # must resubmit (it may re-confirm the same answer).
@@ -373,6 +492,8 @@ def run_example(
         items = state.current_answer
     elif passed:
         items, source = passed[0], "first_verified"
+    elif drift_guard_enabled and incumbent_candidate:
+        items, source = incumbent_candidate, "incumbent_candidate"
     elif any(c for c, _ in candidates):
         items, source = next(c for c, _ in candidates if c), "first_candidate"
 
@@ -401,7 +522,8 @@ def run_example(
     evidence.update({"answer_source": source, "steps_used": state.steps_used,
                      "terminated": terminated, "skills": skills_used,
                      "verify_retries": verify_retries,
-                     "candidates": [c for c, _ in candidates]})
+                     "candidates": [c for c, _ in candidates],
+                     "verify_history": verify_history})
     if last_verify is not None:
         evidence["verify"] = last_verify
     pred = Prediction(
