@@ -30,6 +30,14 @@ from .sandbox import run_code
 
 
 _ENABLE_COUNT_CHECK = os.environ.get("VERIFY_COUNT_CHECK", "0").strip() == "1"
+# Keep follow-up deterministic checks rollback-safe via env switch.
+_ENABLE_FOLLOWUP_DET = os.environ.get("VERIFY_FOLLOWUP_DET", "1").strip() == "1"
+# Independent recomputation tier for count/aggregation questions. The verifier
+# generates its OWN pandas snippet (blind to the solver's answer), runs it in the
+# sandbox, and compares — surfacing a second opinion that can TRIGGER a re-derivation
+# (it never replaces the answer directly; the agent's candidate pool guards that).
+# Default ON; set VERIFY_COMPUTE_RECHECK=0 to fall back to v2plus behavior.
+_ENABLE_COMPUTE_RECHECK = os.environ.get("VERIFY_COMPUTE_RECHECK", "1").strip() == "1"
 
 
 @dataclass
@@ -505,6 +513,28 @@ def non_distinct_question_nunique_issues(question: str, code_history: str) -> li
     return []
 
 
+def followup_deterministic_issues(
+    question: str,
+    items: list[str],
+    df: Optional["pd.DataFrame"],
+    code_history: str,
+) -> list[str]:
+    """High-precision deterministic checks safe to re-run in later debate rounds.
+
+    We intentionally keep this subset narrow to avoid over-constraining follow-up
+    rounds with lower-precision heuristics.
+    """
+    issues: list[str] = []
+    # Canonical choice normalization remains objective across rounds.
+    issues += comparative_choice_issues(question, items)
+    # "X appear in Y column" is mechanically computable from the table.
+    if df is not None:
+        issues += appear_in_column_count_issues(question, items, df)
+    # Total/how-many + unique/nunique mismatch is a frequent objective drift.
+    issues += non_distinct_question_nunique_issues(question, code_history)
+    return issues
+
+
 # --------------------------------------------------------------------------
 # Tier 2 — table-aware LLM check on an independent model
 # --------------------------------------------------------------------------
@@ -795,6 +825,141 @@ def count_check(
 
 
 # --------------------------------------------------------------------------
+# Tier 2d — COMPUTE recheck: the verifier independently RECOMPUTES the answer
+# (blind to the solver's answer) and compares. Targets the systematic MISS where
+# the LLM reviewer accepts a "plausible/defensible" count without recomputing.
+# --------------------------------------------------------------------------
+
+_COMPUTE_SYSTEM = """You are an INDEPENDENT calculator for a table COUNT / AGGREGATION question.
+You are given ONLY the question and the table's schema + a sample of rows. You do NOT see
+anyone else's answer. Compute the answer YOURSELF, from scratch.
+
+Write ONE short pandas snippet that operates on the DataFrame `df` already in scope and
+assigns the final result to a variable named `answer`. Your snippet runs on the FULL table
+(the sample only shows you column names and value formats).
+
+Counting conventions — apply UNLESS the question explicitly says otherwise:
+- "how many / number of / total (number of) X" → count of MATCHING ROWS, NOT distinct
+  values — unless the question literally says distinct / different / unique / separate.
+- Threshold words map exactly: "at least"/"no less than" → >=, "at most"/"no more than" → <=,
+  "more than"/"over"/"greater than" → >, "less than"/"under"/"fewer than" → <.
+- Respect any SUBSET qualifier in the question (a specific category/year/name); do not
+  count rows outside that subset.
+- Drop obvious summary/total rows when they would double-count.
+- Parse numeric strings (strip commas, %, currency, units) before numeric comparisons.
+
+If the answer genuinely cannot be computed from this table, set answer = None.
+
+Respond JSON only:
+{"code": "<python that sets the variable answer>", "approach": "one short line on your method"}"""
+
+
+def _stringify_scalar(v: Any) -> Optional[str]:
+    """Coerce a recomputed scalar into a comparable string, or None to abstain.
+
+    Booleans and non-scalar containers (DataFrame/Series/list of many) abstain so we
+    never raise a false mismatch on something we cannot compare cleanly.
+    """
+    import numbers
+
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (list, tuple)):
+        if len(v) != 1:
+            return None
+        return _stringify_scalar(v[0])
+    if isinstance(v, numbers.Number):
+        try:
+            f = float(v)
+        except Exception:  # noqa: BLE001
+            return None
+        if f != f:  # NaN
+            return None
+        return str(int(f)) if f.is_integer() else repr(f)
+    if isinstance(v, str):
+        s = v.strip()
+        return s or None
+    return None
+
+
+def compute_recheck(
+    client: LLMClient,
+    question: str,
+    items: list[str],
+    df: Optional["pd.DataFrame"],
+    table_view: str = "",
+    *,
+    max_tokens: int = 640,
+) -> VerifyResult:
+    """Verifier independently recomputes a count/agg answer and compares to the solver.
+
+    Returns a flag (ok=False) ONLY on a clean, executed numeric disagreement. Any
+    uncertainty (no df, bad code, exec error, non-scalar result) ABSTAINS (ok=True,
+    source="none:compute_*") so this tier can only ADD signal, never invent a mismatch.
+    """
+    if df is None:
+        return VerifyResult(ok=True, source="none:compute_no_df", model=client.config.model)
+
+    user = (
+        f"Question: {question}\n\n"
+        f"Table columns: {list(df.columns)}\n\n"
+        f"Schema + sample rows:\n{table_view or '(not provided)'}\n"
+    )
+    try:
+        resp = client.chat(
+            messages=[{"role": "system", "content": _COMPUTE_SYSTEM},
+                      {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=0.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return VerifyResult(ok=True, source="none:compute_error", model=client.config.model,
+                            raw=f"compute skipped: {type(exc).__name__}: {exc}")
+
+    parsed = _parse_json(resp.text or "")
+    if parsed.get("_parse_failed"):
+        return VerifyResult(ok=True, source="none:compute_parse_error", model=client.config.model,
+                            raw=(resp.text or "")[:200])
+    code = str(parsed.get("code") or "").strip()
+    approach = str(parsed.get("approach") or "").strip()
+    if not code:
+        return VerifyResult(ok=True, source="none:compute_no_code", model=client.config.model)
+
+    res = run_code(code, df)
+    if not res.ok:
+        return VerifyResult(ok=True, source="none:compute_exec_error", model=client.config.model,
+                            raw=(res.error or "")[:200])
+    rv = _stringify_scalar(res.answer)
+    if rv is None:
+        return VerifyResult(ok=True, source="none:compute_abstain", model=client.config.model,
+                            raw=f"non-scalar/None recompute ({approach})"[:200])
+
+    try:
+        match = answers_match([rv], items)
+    except Exception:  # noqa: BLE001
+        match = _norm_cmp(rv) == _norm_cmp(" ".join(items))
+    if match:
+        return VerifyResult(ok=True, source="compute", model=client.config.model,
+                            recomputed=[rv], compute_match=True,
+                            raw=f"compute agrees: {rv} ({approach})"[:300])
+
+    issue = (
+        f"Independent recomputation produced {rv} for this count, which differs from the "
+        f"submitted answer {items}. Re-check the counting UNIT (rows vs distinct/events), "
+        f"the SUBSET/filter, and THRESHOLD boundaries (>=, <=, >, <)."
+    )
+    return VerifyResult(
+        ok=False, issues=[issue], source="compute", axis="C",
+        model=client.config.model, recomputed=[rv], compute_match=False,
+        verifier_code=code, verifier_reasoning=approach,
+        fix_hint=(f"An independent recomputation got {rv}. Re-derive the count from the table "
+                  f"and confirm the unit/subset/threshold; resubmit your original answer only if "
+                  f"you can show it is right."),
+        raw=f"compute[{rv}] {approach} :: {code[:160]}"[:400],
+    )
+
+
+# --------------------------------------------------------------------------
 # Tier 2b — AUDIT check: reviews the generator's code history for specific flaws
 # (does NOT re-answer from scratch — only audits the generator's own reasoning)
 # --------------------------------------------------------------------------
@@ -1008,7 +1173,7 @@ def verify(
     if not items:
         return VerifyResult(ok=True, source="none")
 
-    # Tier 1: deterministic (no model cost) — only on round 1.
+    # Tier 1: deterministic (no model cost) — full set on round 1.
     # NOTE: cell_substring_issues / format_drift_issues were measured on a 1000-example
     # set to have LOW precision (substr 6/26, drift 0/1) — they mostly fire on CORRECT
     # answers (multi-line cells, 'India (IND)', month names) and fixed nothing, so they
@@ -1019,6 +1184,11 @@ def verify(
             det += fullname_label_issues(question, items, df)
             det += appear_in_column_count_issues(question, items, df)
         det += non_distinct_question_nunique_issues(question, code_history)
+        if det:
+            return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
+    elif _ENABLE_FOLLOWUP_DET:
+        # Later rounds: only re-run narrow, high-precision deterministic checks.
+        det = followup_deterministic_issues(question, items, df, code_history)
         if det:
             return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
 
@@ -1043,6 +1213,16 @@ def verify(
     count_review = (
         count_check(client, question, items, table_view, evidence_summary, browse_notes)
         if _ENABLE_COUNT_CHECK and _COUNT_Q_RE.search(question or "")
+        else VerifyResult(ok=True, source="none")
+    )
+
+    # Tier 2d: independent recomputation (blind second opinion) for count/agg
+    # questions. Round 1 only — provides a triggering signal; later rounds rely on
+    # the audit follow-up to avoid endless recompute tug-of-war.
+    compute_review = (
+        compute_recheck(client, question, items, df, table_view)
+        if (_ENABLE_COMPUTE_RECHECK and debate_round <= 1
+            and df is not None and _COUNT_Q_RE.search(question or ""))
         else VerifyResult(ok=True, source="none")
     )
 
@@ -1074,13 +1254,18 @@ def verify(
         issues += count_review.issues
         axis = count_review.axis or axis
         sources.append("count")
+    if not compute_review.ok:
+        ok = False
+        issues += compute_review.issues
+        axis = compute_review.axis or axis
+        sources.append("compute")
 
     if sources:
         final_source = "+".join(sources)
     else:
         # Preserve skip diagnostics (llm/audit errors, parse issues) instead of
         # collapsing everything to plain "none".
-        diag = [s for s in (review.source, audit.source, count_review.source)
+        diag = [s for s in (review.source, audit.source, count_review.source, compute_review.source)
                 if isinstance(s, str) and s.startswith("none:")]
         final_source = "+".join(diag) if diag else "none"
     raw_parts = []
@@ -1090,16 +1275,20 @@ def verify(
         raw_parts.append(f"audit[{audit.source}] {audit.raw}")
     if count_review.raw:
         raw_parts.append(f"count[{count_review.source}] {count_review.raw}")
+    if compute_review.raw:
+        raw_parts.append(f"compute[{compute_review.source}] {compute_review.raw}")
     merged_raw = " || ".join(raw_parts)[:800]
     return VerifyResult(
         ok=ok,
         issues=issues,
-        fix_hint=audit.fix_hint or review.fix_hint,
+        fix_hint=audit.fix_hint or compute_review.fix_hint or review.fix_hint,
         source=final_source,
         axis=axis,
         model=client.config.model,
-        verifier_code=audit.verifier_code,
-        verifier_reasoning=audit.verifier_reasoning or review.fix_hint,
+        recomputed=compute_review.recomputed,
+        compute_match=compute_review.compute_match,
+        verifier_code=audit.verifier_code or compute_review.verifier_code,
+        verifier_reasoning=audit.verifier_reasoning or compute_review.verifier_reasoning or review.fix_hint,
         raw=merged_raw,
     )
 

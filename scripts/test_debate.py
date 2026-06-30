@@ -153,6 +153,36 @@ def preflight_client(name: str, client: LLMClient) -> bool:
     return True
 
 
+def _ckpt_path(save_path: str | Path) -> Path:
+    p = Path(save_path)
+    return p.with_suffix(p.suffix + ".partial.json")
+
+
+def _load_ckpt(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        with open(path, encoding="utf8") as f:
+            doc = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+    rows = doc.get("results", [])
+    return rows if isinstance(rows, list) else []
+
+
+def _save_ckpt(path: Path, results: list[dict], budget: Budget,
+               cfg_model: str, vcfg_model: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf8") as f:
+        json.dump({
+            "config": {"generator_model": cfg_model, "verifier_model": vcfg_model},
+            "budget": budget.__dict__,
+            "results": results,
+        }, f, ensure_ascii=False, indent=2, default=str)
+    tmp.replace(path)
+
+
 def run_single(ex, client: LLMClient, verifier_client: LLMClient,
                registry, prompts, budget: Budget) -> dict:
     from src.data import load_table
@@ -239,15 +269,22 @@ def main() -> None:
         print(f"WARNING: IDs not found in dev split: {missing}")
         target_ids = [eid for eid in target_ids if eid in example_map]
 
-    results = []
-    n_correct = 0
+    results: list[dict] = []
+    done_ids: set[str] = set()
+    if args.save:
+        results = _load_ckpt(_ckpt_path(args.save))
+        done_ids = {r["id"] for r in results if r.get("id")}
+        if done_ids:
+            print(f"[resume] checkpoint has {len(done_ids)} finished — skipping them")
 
     for i, eid in enumerate(target_ids, 1):
+        if eid in done_ids:
+            continue
         ex = example_map[eid]
         prev = PREV_ANSWERS.get(eid, {})
 
         print(divider("─"))
-        print(f"[{i}/{len(target_ids)}] {eid}")
+        print(f"[{i}/{len(target_ids)}] {eid}", flush=True)
         print(f"  Question : {ex.utterance}")
         print(f"  Gold     : {ex.target_value}")
         if prev:
@@ -258,12 +295,17 @@ def main() -> None:
         try:
             result = run_single(ex, client, verifier_client, registry, prompts, budget)
         except Exception as exc:  # noqa: BLE001
-            print(f"  ERROR: {exc}")
-            results.append({"id": eid, "error": str(exc)})
+            print(f"  ERROR: {exc}", flush=True)
+            result = {"id": eid, "error": str(exc)}
+
+        results.append(result)
+        if args.save:
+            _save_ckpt(_ckpt_path(args.save), results, budget, cfg.model, vcfg.model)
+
+        if "error" in result:
             continue
 
         correct = result["correct"]
-        n_correct += correct
         mark = "✓" if correct else "✗"
         print(f"\n  NEW ANSWER: {result['pred']}  [{mark}]  (src={result['src']})")
         if result.get("verify"):
@@ -276,13 +318,13 @@ def main() -> None:
 
         print("\n  — Full trace —")
         print_trace(result.get("trace", []))
+        print(flush=True)
 
-        results.append(result)
-        print()
-
+    n_correct = sum(1 for r in results if r.get("correct"))
+    n_done = len(results)
     print(divider("═"))
-    print(f"\nSUMMARY: {n_correct}/{len(results)} correct  "
-          f"({100*n_correct/max(len(results),1):.1f}%)")
+    print(f"\nSUMMARY: {n_correct}/{n_done} correct  "
+          f"({100*n_correct/max(n_done,1):.1f}%)")
     print()
 
     # Per-example breakdown
@@ -308,9 +350,16 @@ def main() -> None:
     if args.save:
         save_path = Path(args.save)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(save_path, "w") as f:
-            json.dump({"budget": budget.__dict__, "results": results}, f,
-                      ensure_ascii=False, indent=2, default=str)
+        payload = {
+            "config": {"generator_model": cfg.model, "verifier_model": vcfg.model},
+            "budget": budget.__dict__,
+            "results": results,
+        }
+        with open(save_path, "w", encoding="utf8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        ckpt = _ckpt_path(save_path)
+        if ckpt.exists():
+            ckpt.unlink()
         print(f"\nResults saved to: {save_path}")
 
 
