@@ -102,12 +102,23 @@ class VerifyResult:
     verifier_stdout: str = ""
     verifier_reasoning: str = ""
     raw: str = ""
+    # Follow-up-audit engagement bookkeeping (debate_round >= 2 only). Lets us
+    # distinguish "verifier legitimately keeps a concern open because the
+    # generator never engaged with it" from "verifier is anchored — the
+    # generator DID provide new evidence but the verifier ignored it and just
+    # repeated the same concern". See build_debate_prompt / audit_check.
+    #   resolution: "accepted" | "unaddressed" | "insufficient" | "new_issue" | ""
+    #   new_evidence_quote: the specific new value/line the auditor says it
+    #     engaged with (empty ⇒ auditor claims the generator provided nothing new)
+    resolution: str = ""
+    new_evidence_quote: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"ok": self.ok, "issues": self.issues, "fix_hint": self.fix_hint,
                 "source": self.source, "axis": self.axis, "model": self.model,
                 "recomputed": self.recomputed, "compute_match": self.compute_match,
-                "verifier_reasoning": self.verifier_reasoning, "raw": self.raw}
+                "verifier_reasoning": self.verifier_reasoning, "raw": self.raw,
+                "resolution": self.resolution, "new_evidence_quote": self.new_evidence_quote}
 
 
 def answers_match(a: list[str], b: list[str]) -> bool:
@@ -1161,28 +1172,45 @@ Respond with JSON only:
 
 _AUDIT_FOLLOWUP_SYSTEM = """You are a meticulous code auditor in round {round} of a debate about a table question-answering answer.
 
-CONTEXT: In a previous round you raised a concern about the student's work. The student has since run
-additional code to respond to your challenge. The code history now includes BOTH the original steps
-AND their counter-code (the newer steps at the end).
+CONTEXT: In a previous round you raised a concern about the student's work. Your previous concern was:
+{previous_concern}
 
-Your task:
-1. Review the student's counter-code carefully.
-2. If their counter-code ADDRESSES your previous concern: set "flawed": false and "resolution": "accepted".
-3. If their counter-code does NOT address the core issue, or reveals a NEW concrete flaw: flag it.
-   - Be specific: point to the counter-code step that fails or the original flaw that persists.
-   - Your previous concern was: {previous_concern}
+The code history now includes BOTH the original steps AND whatever the student did since your
+challenge (the newer steps at the end, marked in the note below).
 
-RESOLUTION STANDARD: Accept only if the counter-code DIRECTLY addresses the previous concern with
-explicit table/code evidence. If the new answer changes but the core issue remains untested, keep
-the concern open and request one concrete check.
+STEP 1 — Did the student actually engage with your concern?
+Look at the newest steps only. Did the student run NEW code (e.g. the test you suggested, or an
+equivalent check) that produces a NEW concrete output bearing on your concern? Or did they just
+resubmit the same answer / repeat the same claim in prose without running anything new?
+  - If there is genuinely NO new code/output since last round → the concern is "unaddressed". You
+    are justified in keeping it open; you do NOT need new reasoning to do this (the burden was on
+    the student and they did not meet it). Set "flawed": true, "resolution": "unaddressed".
+  - If there IS new code/output → go to STEP 2.
+
+STEP 2 — Engage with the specific new evidence (only if new code/output exists).
+Quote the exact new value or line the student's new step produced into "new_evidence_quote".
+Then decide:
+  - "accepted": the new evidence directly resolves your concern → "flawed": false.
+  - "insufficient": the new evidence does NOT resolve it → "flawed": true. Your "reasoning" MUST
+    explain SPECIFICALLY why THIS new value/output still fails to address the concern — reference
+    the quoted evidence by value. Do NOT just restate your previous round's reasoning verbatim; if
+    you find yourself writing nearly the same sentence as before, that is a sign you have not
+    actually looked at the new evidence — go back and look again.
+  - "new_issue": the new step reveals a different, unrelated concrete flaw → "flawed": true.
+
+HARD RULE: you may only choose "insufficient" or "new_issue" if "new_evidence_quote" is non-empty
+and your reasoning explicitly references it. If you cannot point to a specific new value/output and
+explain concretely why it fails, and the student DID run new code, you must set "resolution":
+"accepted" (benefit of the doubt goes to evidence you cannot refute).
 
 Respond with JSON only:
 {{
   "flawed": true|false,
-  "resolution": "accepted"|"rejected"|"new_issue",
+  "resolution": "accepted"|"unaddressed"|"insufficient"|"new_issue",
+  "new_evidence_quote": "the exact new value/line from the student's latest step (empty if none exists)",
   "step": "which step is still flawed (empty if accepted)",
   "flaw": "ONE sentence naming the remaining/new error (empty if accepted)",
-  "reasoning": "2-4 sentences: why the counter-code does or does not resolve the concern, citing specific code lines or table values as evidence",
+  "reasoning": "2-4 sentences citing the new_evidence_quote (if any) and specific code lines/table values as evidence",
   "test": "one line of pandas code to verify the remaining claim (or empty string)"
 }}"""
 
@@ -1197,6 +1225,7 @@ def audit_check(
     *,
     debate_round: int = 1,
     previous_concern: str = "",
+    new_code_since_last_round: Optional[bool] = None,
     max_tokens: int = 1024,
 ) -> VerifyResult:
     """Audit the generator's own code history for a specific logical flaw.
@@ -1218,10 +1247,21 @@ def audit_check(
 
     round_note = ""
     if debate_round > 1:
+        if new_code_since_last_round is False:
+            engagement_note = (
+                "The student did NOT run any new code since your last concern — the history "
+                "below is unchanged from last round (or only prose was added)."
+            )
+        elif new_code_since_last_round is True:
+            engagement_note = (
+                "The student DID run new code since your last concern — look at the newest "
+                "steps at the end of the history for their response."
+            )
+        else:
+            engagement_note = "The newer code steps at the end of the history are the student's response."
         round_note = (
-            f"\n\n[Note: This is debate round {debate_round}. "
-            f"The newer code steps at the end of the history are the student's response "
-            f"to the previous concern: {previous_concern or '(see prior round)'}]"
+            f"\n\n[Note: This is debate round {debate_round}. {engagement_note} "
+            f"Previous concern: {previous_concern or '(see prior round)'}]"
         )
 
     user = (
@@ -1252,15 +1292,46 @@ def audit_check(
     if parsed.get("_parse_failed"):
         return VerifyResult(ok=True, source="none:audit_parse_error", model=client.config.model, raw=raw[:300])
     flawed = bool(parsed.get("flawed", False))
+    resolution = str(parsed.get("resolution") or "").strip().lower()
+    new_evidence_quote = str(parsed.get("new_evidence_quote") or "").strip()
+
+    if debate_round > 1:
+        if not resolution:
+            # Legacy fallback for models that ignore the new field.
+            resolution = "insufficient" if flawed else "accepted"
+        # ── Anti-anchoring guard (mechanical, does not trust the LLM's self-report) ──
+        # The generator DID run new code but the auditor could not point to a specific
+        # new value/output it engaged with — the auditor is not allowed to keep
+        # rejecting evidence it cannot cite. Force acceptance.
+        if (
+            new_code_since_last_round is True
+            and flawed
+            and resolution in ("insufficient", "new_issue")
+            and not new_evidence_quote
+        ):
+            flawed = False
+            resolution = "accepted_forced"  # anti-anchoring guard fired
+        # The generator did NOT run new code — the auditor is legitimately entitled to
+        # keep the concern open without fresh engagement; label it as such for the
+        # anchored-rejection metric even if the model didn't say "unaddressed" itself.
+        elif new_code_since_last_round is False and flawed:
+            resolution = "unaddressed"
+
     if not flawed:
-        return VerifyResult(ok=True, source="audit", model=client.config.model, raw=raw[:300])
+        return VerifyResult(
+            ok=True, source="audit", model=client.config.model, raw=raw[:300],
+            resolution=resolution, new_evidence_quote=new_evidence_quote,
+        )
 
     step_desc = str(parsed.get("step") or "").strip()
     flaw_desc = str(parsed.get("flaw") or "").strip()
     reasoning = str(parsed.get("reasoning") or "").strip()
     test_code = str(parsed.get("test") or "").strip()
     if not flaw_desc:
-        return VerifyResult(ok=True, source="none", model=client.config.model, raw=raw[:300])
+        return VerifyResult(
+            ok=True, source="none", model=client.config.model, raw=raw[:300],
+            resolution=resolution, new_evidence_quote=new_evidence_quote,
+        )
 
     issue = f"[{step_desc}] {flaw_desc}" if step_desc else flaw_desc
     return VerifyResult(
@@ -1270,6 +1341,8 @@ def audit_check(
         verifier_reasoning=reasoning,
         fix_hint=f"Run: {test_code}" if test_code else (reasoning[:120] if reasoning else ""),
         raw=raw[:300],
+        resolution=resolution,
+        new_evidence_quote=new_evidence_quote,
     )
 
 
@@ -1289,6 +1362,7 @@ def verify(
     use_llm: bool = True,
     debate_round: int = 1,
     previous_concern: str = "",
+    new_code_since_last_round: Optional[bool] = None,
 ) -> VerifyResult:
     """Three tiers, all running independently:
       1. deterministic rules (no model) — short-circuits on high-precision hits
@@ -1365,6 +1439,7 @@ def verify(
             client, question, items, code_history, table_view, browse_notes,
             debate_round=debate_round,
             previous_concern=previous_concern,
+            new_code_since_last_round=new_code_since_last_round,
         )
         if code_history else VerifyResult(ok=True, source="none")
     )
@@ -1423,6 +1498,8 @@ def verify(
         verifier_code=audit.verifier_code or compute_review.verifier_code,
         verifier_reasoning=audit.verifier_reasoning or compute_review.verifier_reasoning or review.fix_hint,
         raw=merged_raw,
+        resolution=audit.resolution,
+        new_evidence_quote=audit.new_evidence_quote,
     )
 
 

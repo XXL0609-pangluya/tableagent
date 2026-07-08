@@ -289,6 +289,10 @@ def run_example(
     debate_rounds_granted = 0
     # Multi-round debate: track the concern raised in each round for follow-up context
     last_debate_concern: str = ""
+    # How many code_history_parts existed as of the previous verify() call — lets the
+    # follow-up audit know whether the generator actually ran NEW code in response to
+    # the last concern, vs just resubmitting without engaging (see audit_check).
+    code_steps_at_last_verify = 0
 
     step = 0
     while step < effective_max_steps:
@@ -399,6 +403,10 @@ def run_example(
                 if candidate and incumbent_candidate is None:
                     incumbent_candidate = list(candidate)
                 code_history = "\n\n".join(code_history_parts)
+                new_code_since_last_round = (
+                    len(code_history_parts) > code_steps_at_last_verify
+                    if verify_retries > 0 else None  # round 1: concept doesn't apply
+                )
                 vr = verify(
                     verifier_client or client, example.utterance, candidate,
                     df=table_context.df,
@@ -407,7 +415,9 @@ def run_example(
                     code_history=code_history,
                     debate_round=verify_retries + 1,       # round 1 = fresh audit
                     previous_concern=last_debate_concern,  # empty on round 1
+                    new_code_since_last_round=new_code_since_last_round,
                 )
+                code_steps_at_last_verify = len(code_history_parts)
                 last_verify = vr.to_dict()
                 verify_history.append(last_verify)
                 if len(verify_history) > 10:
@@ -416,7 +426,10 @@ def run_example(
                 if tracer:
                     tracer.add(TraceEvent(
                         step=step, kind="verify",
-                        note=f"ok={vr.ok} src={vr.source} issues={vr.issues[:2]}",
+                        note=(f"ok={vr.ok} src={vr.source} issues={vr.issues[:2]} "
+                              f"resolution={vr.resolution or '-'} "
+                              f"new_evidence={'yes' if vr.new_evidence_quote else 'no'} "
+                              f"new_code={new_code_since_last_round}"),
                     ))
                 if not vr.ok and verify_retries < budget.max_verify_retries:
                     # Record the concern so the next round's follow-up audit can

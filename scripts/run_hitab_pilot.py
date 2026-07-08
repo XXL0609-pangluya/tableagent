@@ -6,7 +6,7 @@ finalize) with HiTab-specific loading (`src/hitab_data.py`) and matching
 
 Usage:
   python scripts/run_hitab_pilot.py --split dev --n 20 --save results/hitab_pilot_dev20.json
-  python scripts/run_hitab_pilot.py --n 100 --max-steps 20 --max-rounds 2
+  python scripts/run_hitab_pilot.py --n 100 --max-steps 20 --max-rounds 6
 
 Checkpoint/resume: partial results are written to <save>.partial.json after each
 example so a long run can be resumed.
@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
@@ -193,7 +194,7 @@ def main() -> None:
     ap.add_argument("--split", default="dev", choices=["train", "dev", "test"])
     ap.add_argument("--n", type=int, default=20, help="number of examples (from the front of the split)")
     ap.add_argument("--max-steps", type=int, default=20)
-    ap.add_argument("--max-rounds", type=int, default=2, help="max_verify_retries (debate rounds)")
+    ap.add_argument("--max-rounds", type=int, default=6, help="max_verify_retries (debate rounds)")
     ap.add_argument("--debate-steps", type=int, default=3)
     ap.add_argument("--save", type=str, default=None)
     ap.add_argument("--ids-file", type=str, default=None,
@@ -241,17 +242,21 @@ def main() -> None:
     for i, ex in enumerate(examples, 1):
         if ex.id in done:
             continue
+        t0 = time.monotonic()
         try:
             r = run_single(ex, client, verifier_client, registry, prompts, budget)
         except Exception as exc:  # noqa: BLE001
-            print(f"[{i}/{len(examples)}] {ex.id} ERROR: {exc}", flush=True)
+            elapsed = time.monotonic() - t0
+            print(f"[{i}/{len(examples)}] {ex.id} ERROR: {exc}  ({elapsed:.1f}s)", flush=True)
             r = {"id": ex.id, "error": str(exc)}
+        elapsed = time.monotonic() - t0
+        r["elapsed_s"] = round(elapsed, 1)
         results.append(r)
         if args.save:
             _save(_ckpt_path(args.save), results, budget, cfg.model, vcfg.model, args.split)
         mark = "OK " if r.get("correct") else ("ERR" if "error" in r else "  X")
         print(f"[{i}/{len(examples)}] {mark} {ex.id}  pred={r.get('pred')}  gold={r.get('gold')}  "
-              f"(src={r.get('src')}, rounds={r.get('verify_retries')})", flush=True)
+              f"(src={r.get('src')}, rounds={r.get('verify_retries')}, {elapsed:.1f}s)", flush=True)
 
     n_correct = sum(1 for r in results if r.get("correct"))
     n_err = sum(1 for r in results if "error" in r)
