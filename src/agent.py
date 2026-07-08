@@ -70,11 +70,22 @@ def select_skills(question: str) -> list[str]:
 class Prompts:
     charter: str
     skills: dict[str, str] = field(default_factory=dict)
+    # Progressive-disclosure modules appended per-question when their regex
+    # patterns match the question. Each entry is (name, patterns, text). Empty
+    # by default so WTQ (and any caller that doesn't set it) is unaffected. Used
+    # by HiTab to route dataset-specific convention blocks by question type
+    # instead of dumping the whole skill file on every question.
+    dynamic_modules: list[tuple[str, tuple[str, ...], str]] = field(default_factory=list)
 
     def system_for(self, question: str) -> tuple[str, list[str]]:
         """Assemble the system prompt for a question and report skills used."""
         used = ["general"] + [s for s in select_skills(question) if s in self.skills]
         body = [self.charter] + [self.skills[name] for name in used if name in self.skills]
+        q = (question or "").lower()
+        for name, patterns, text in self.dynamic_modules:
+            if not patterns or any(re.search(p, q) for p in patterns):
+                body.append(text)
+                used.append(name)
         return "\n\n".join(body), used
 
 

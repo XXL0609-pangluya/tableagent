@@ -35,7 +35,7 @@
 - `load_examples(split_basename, dataset_root=DEFAULT) -> list[Example]`
 - `load_table(table_path, dataset_root=DEFAULT) -> TableContext`
 - `sample_examples(examples, n, seed=13) -> list[Example]`（确定性"快集"）
-- 常量：`DEFAULT_DATASET_ROOT`
+- 常量：`DEFAULT_DATASETS_DIR`, `DEFAULT_DATASET_ROOT`（默认 `datasets/WikiTableQuestions`；可用 `WTQ_DATASET_ROOT` 覆盖）
 - 不变量：`load_table` 返回的 `df` 全为字符串列；`schema_text`/`sample_rows` 已就绪。
 
 ## `src/evaluator.py` — 官方评测器(Py3 移植)

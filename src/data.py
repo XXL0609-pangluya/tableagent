@@ -16,9 +16,13 @@ import pandas as pd
 from .evaluator import tsv_unescape, tsv_unescape_list
 from .schemas import Example, TableContext
 
-# Default dataset root relative to repo root.
+# Default dataset roots relative to repo root.
 _REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
-DEFAULT_DATASET_ROOT = os.path.join(_REPO_ROOT, "WikiTableQuestions")
+DEFAULT_DATASETS_DIR = os.path.join(_REPO_ROOT, "datasets")
+DEFAULT_DATASET_ROOT = os.environ.get(
+    "WTQ_DATASET_ROOT",
+    os.path.join(DEFAULT_DATASETS_DIR, "WikiTableQuestions"),
+)
 DEFAULT_DISPUTED_PATH = os.path.join(_REPO_ROOT, "eval", "disputed.json")
 
 

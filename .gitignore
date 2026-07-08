@@ -11,6 +11,7 @@ results/
 
 # Dataset is large; keep it out of git (clone separately)
 WikiTableQuestions/
+datasets/
 
 # Reference code copied for study only
 openclaw-agent-study/

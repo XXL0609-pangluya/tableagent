@@ -293,7 +293,11 @@ TraceEvent   = { step, kind, prompt_hash, tool_call, observation, tokens, latenc
 
 ```
 TableAgent/
-├── WikiTableQuestions/        # 数据集（已下载）
+├── datasets/
+│   ├── WikiTableQuestions/    # WTQ（主实验）
+│   ├── HiTab/
+│   ├── FinQA/
+│   └── Table-Fact-Checking/
 ├── PLAN.md                    # 本文档
 ├── src/
 │   ├── config.py              # 模型/路径/超参集中配置 + run manifest

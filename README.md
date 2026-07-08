@@ -18,8 +18,9 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Dataset (not committed):
-git clone https://github.com/ppasupat/WikiTableQuestions.git
+# Datasets (not committed; place under datasets/):
+mkdir -p datasets
+git clone https://github.com/ppasupat/WikiTableQuestions.git datasets/WikiTableQuestions
 
 # Config:
 cp .env.example .env   # then fill in LLM_BASE_URL / LLM_API_KEY / LLM_MODEL

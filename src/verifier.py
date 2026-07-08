@@ -38,6 +38,49 @@ _ENABLE_FOLLOWUP_DET = os.environ.get("VERIFY_FOLLOWUP_DET", "1").strip() == "1"
 # (it never replaces the answer directly; the agent's candidate pool guards that).
 # Default ON; set VERIFY_COMPUTE_RECHECK=0 to fall back to v2plus behavior.
 _ENABLE_COMPUTE_RECHECK = os.environ.get("VERIFY_COMPUTE_RECHECK", "1").strip() == "1"
+# HiTab-specific answer-convention checks (percent->decimal ratio). Gated off by
+# default so the WTQ path is completely unaffected; the HiTab pilot sets
+# HITAB_VERIFY=1. Read lazily (in-function) so import order does not matter.
+
+
+def _hitab_verify_on() -> bool:
+    return os.environ.get("HITAB_VERIFY", "0").strip() == "1"
+
+
+_HITAB_VERIFIER_SUFFIX = """
+
+═══ HiTab DATASET CONVENTIONS (this run is HiTab, NOT WTQ) ═══
+THE ONE RULE: HiTab gold = the VERBATIM output of one formula over the cells.
+A COMPUTED value = raw float (≥6 significant digits), and any computed
+difference/decline/change is POSITIVE. A value COPIED from ONE cell keeps that
+cell's exact digits, scale, and sign. Judge form against this — do NOT impose
+WTQ "copy the cell / keep %" habits. Specifically:
+- "what/how many percent of X is Y" COMPUTED by dividing two RAW COUNTS (Y/X):
+  the CORRECT gold is the DECIMAL RATIO (e.g. 0.186393), NOT ×100 (18.6). Do NOT
+  flag a decimal ratio like 0.191 as "missing %", "wrong format", or "should be a
+  percentage" — it is CORRECT. Do NOT demand a "%" sign.
+- BUT if the table has a "percent"/"%" column whose cells already hold percentage
+  values (50, 25, 16), the gold reads/sums them as-is (50, 41, 6) — do NOT flag
+  those as "should be a decimal".
+- "how many times higher is A than B" → A/B as a decimal (e.g. 1.888889).
+- growth rate / percentage change you COMPUTE as (a-b)/c → POSITIVE decimal
+  (e.g. 0.174263), NOT ×100 and NOT negative. Do NOT flag a positive decimal as
+  wrong-sign; do NOT demand a minus sign on a computed change.
+- SIGN: a COMPUTED change/decline/difference/gap is a POSITIVE magnitude
+  ("declined how many percent" → 4, "the decline was" cell -24 → 24). Do NOT flag
+  the missing minus sign — positive is CORRECT. ONLY a value read verbatim from a
+  single cell that itself shows a minus (e.g. -2.27, -23.4) keeps that minus.
+- "which group / which X" → the gold is the table's canonical short ROW LABEL
+  (e.g. "transgender"), NOT the question's longer wording ("transgender
+  canadians"). Do NOT flag a short label as a truncation of the question phrase.
+When in doubt about form on a HiTab percent/label/sign answer, PASS — these
+conventions override the general "copy the cell exactly / keep %" rules above."""
+
+
+def _sys_with_hitab(base: str) -> str:
+    """Append HiTab-specific conventions to a verifier system prompt when the
+    HiTab verify mode is on (WTQ path is left untouched)."""
+    return base + _HITAB_VERIFIER_SUFFIX if _hitab_verify_on() else base
 
 
 @dataclass
@@ -536,6 +579,92 @@ def followup_deterministic_issues(
 
 
 # --------------------------------------------------------------------------
+# HiTab-specific answer conventions (gated by HITAB_VERIFY=1; WTQ unaffected)
+# --------------------------------------------------------------------------
+
+# "what/how many percent OF a total IS Y" -> gold is the decimal ratio Y/X in (0,1).
+# Distinguish from "percentage points" / "percent did X decline" (magnitude, can be >1).
+_PERCENT_OF_TOTAL_RE = re.compile(
+    r"\b(?:how many percent|what percentage|what percent)\s+of\b",
+    re.I,
+)
+_PERCENT_POINTS_RE = re.compile(r"\bpercent(?:age)?\s+points?\b", re.I)
+_DECLINE_RE = re.compile(r"\b(?:decline|declined|decreased?|increase|increased?|change|changed)\b", re.I)
+_PERCENT_COLUMN_RE = re.compile(r"(?:\bpercent\b|%|\bshare\b|\bdistribution\b)", re.I)
+_ARITH_DIV_RE = re.compile(r"(?<!\d)\s*/\s*(?!\d)|\bdiv(?:ide)?\s*\(", re.I)
+_MUL_100_RE = re.compile(r"\*\s*100|100\s*\*", re.I)
+
+
+def _looks_like_percent_column_direct_read(code_history: str) -> bool:
+    """Heuristic whitelist for direct reads from already-percent/share columns.
+
+    If counter-code references a percent/share/distribution column and does NOT
+    perform ratio math (divide or *100), treat it as a direct cell read and do
+    not force decimal-ratio conversion.
+    """
+    ch = (code_history or "").strip()
+    if not ch:
+        return False
+    if not _PERCENT_COLUMN_RE.search(ch):
+        return False
+    if _ARITH_DIV_RE.search(ch):
+        return False
+    if _MUL_100_RE.search(ch):
+        return False
+    return True
+
+
+def hitab_percent_ratio_issues(question: str, items: list[str], code_history: str = "") -> list[str]:
+    """Flag a proportion-of-total percent question answered with a percentage (>1)
+    instead of the decimal ratio HiTab expects.
+
+    Precision: only fires on the "percent OF <total> [is/are/was/were] Y" pattern
+    (no "percentage points", no decline/change wording) with a single numeric
+    answer whose magnitude is > 1 (a ratio in (0,1) is already correct).
+    """
+    if not _hitab_verify_on() or len(items) != 1:
+        return []
+    q = (question or "").strip()
+    if not _PERCENT_OF_TOTAL_RE.search(q):
+        return []
+    if _PERCENT_POINTS_RE.search(q):
+        return []
+    # "how many percent did X decline" is a magnitude question, not a ratio-of-total.
+    # Detect decline/change wording OUTSIDE the "of ..." clause: cheap heuristic —
+    # if "decline/decrease/increase/change" appears and the clause after "of" is
+    # short (no "is/are/was/were" tying Y to the total), treat as magnitude.
+    if _DECLINE_RE.search(q) and not re.search(
+        r"\b(?:is|are|was|were|had|has)\b", q[q.find(" of "):]
+    ):
+        return []
+    # Whitelist: if the solver is directly reading from an already-percent/share
+    # column (no ratio math), keep the percentage value as-is.
+    if _looks_like_percent_column_direct_read(code_history):
+        return []
+    ans = items[0].strip()
+    num = _as_number(ans)
+    if num is None:
+        return []
+    if abs(num) <= 1:
+        return []  # already a decimal ratio
+    return [
+        f"HiTab convention: for 'what/how many percent of X is Y' the gold is the "
+        f"DECIMAL RATIO Y/X (between 0 and 1), not the percentage. You returned {ans} "
+        f"(looks like the value ×100). Resubmit the raw ratio as a decimal, e.g. "
+        f"if Y/X = 0.186393 submit '0.186393' — do NOT multiply by 100 and do NOT add '%'."
+    ]
+
+
+def hitab_convention_issues(question: str, items: list[str], code_history: str = "") -> list[str]:
+    """Umbrella for HiTab answer-convention checks (numeric)."""
+    if not _hitab_verify_on():
+        return []
+    issues: list[str] = []
+    issues += hitab_percent_ratio_issues(question, items, code_history)
+    return issues
+
+
+# --------------------------------------------------------------------------
 # Tier 2 — table-aware LLM check on an independent model
 # --------------------------------------------------------------------------
 
@@ -731,7 +860,7 @@ def llm_check(
     )
     try:
         resp = client.chat(
-            messages=[{"role": "system", "content": _LLM_SYSTEM}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": _sys_with_hitab(_LLM_SYSTEM)}, {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.0,
         )
@@ -802,7 +931,7 @@ def count_check(
     )
     try:
         resp = client.chat(
-            messages=[{"role": "system", "content": _COUNT_SYSTEM}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": _sys_with_hitab(_COUNT_SYSTEM)}, {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.0,
         )
@@ -907,7 +1036,7 @@ def compute_recheck(
     )
     try:
         resp = client.chat(
-            messages=[{"role": "system", "content": _COMPUTE_SYSTEM},
+            messages=[{"role": "system", "content": _sys_with_hitab(_COMPUTE_SYSTEM)},
                       {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.0,
@@ -1080,12 +1209,12 @@ def audit_check(
     verify the claim. Does NOT compute a new answer.
     """
     if debate_round <= 1:
-        system = _AUDIT_SYSTEM
+        system = _sys_with_hitab(_AUDIT_SYSTEM)
     else:
-        system = _AUDIT_FOLLOWUP_SYSTEM.format(
+        system = _sys_with_hitab(_AUDIT_FOLLOWUP_SYSTEM.format(
             round=debate_round,
             previous_concern=previous_concern or "(not recorded)",
-        )
+        ))
 
     round_note = ""
     if debate_round > 1:
@@ -1184,11 +1313,15 @@ def verify(
             det += fullname_label_issues(question, items, df)
             det += appear_in_column_count_issues(question, items, df)
         det += non_distinct_question_nunique_issues(question, code_history)
+        if _hitab_verify_on():
+            det += hitab_convention_issues(question, items, code_history)
         if det:
             return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
     elif _ENABLE_FOLLOWUP_DET:
         # Later rounds: only re-run narrow, high-precision deterministic checks.
         det = followup_deterministic_issues(question, items, df, code_history)
+        if _hitab_verify_on():
+            det += hitab_convention_issues(question, items, code_history)
         if det:
             return VerifyResult(ok=False, issues=det, source="deterministic", axis="A")
 
